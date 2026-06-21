@@ -1,0 +1,24 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-surface text-gray-900 font-sans;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-white rounded-lg shadow-sm border border-gray-100 p-6;
+  }
+  .btn-primary {
+    @apply bg-accent hover:bg-indigo-700 text-white font-semibold px-4 py-2 rounded transition-colors;
+  }
+  .btn-secondary {
+    @apply border border-gray-300 hover:bg-gray-50 text-gray-700 font-semibold px-4 py-2 rounded transition-colors;
+  }
+  .badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold;
+  }
+}
