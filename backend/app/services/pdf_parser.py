@@ -193,35 +193,68 @@ def _setup_ocr_env() -> tuple:
     return poppler_path, available_langs
 
 
-def _extract_text_ocr(file_path: str) -> str:
-    """OCR fallback: pdf2image → pytesseract"""
+def _pdf_to_images(file_path: str) -> list:
+    """
+    PDF → PIL Image 리스트 변환
+    우선순위: PyMuPDF (외부 바이너리 불필요) → pdf2image (poppler 필요)
+    """
+    # ── 방법 1: PyMuPDF (fitz) ─────────────────────────────────
+    try:
+        import fitz  # PyMuPDF
+        from PIL import Image
+        import io
+
+        doc = fitz.open(file_path)
+        images = []
+        for page in doc:
+            # dpi=200 에 해당하는 matrix
+            mat = fitz.Matrix(200 / 72, 200 / 72)
+            pix = page.get_pixmap(matrix=mat)
+            img_bytes = pix.tobytes("png")
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            images.append(img)
+        doc.close()
+        logger.info(f"[OCR] PyMuPDF: {len(images)} 페이지 변환 완료")
+        return images
+    except ImportError:
+        logger.info("[OCR] PyMuPDF 없음 → pdf2image 시도")
+    except Exception as e:
+        logger.warning(f"[OCR] PyMuPDF 실패: {e} → pdf2image 시도")
+
+    # ── 방법 2: pdf2image (poppler 필요) ──────────────────────
     try:
         from pdf2image import convert_from_path
+
+        poppler_path, _ = _setup_ocr_env()
+        pages = convert_from_path(file_path, dpi=200, poppler_path=poppler_path)
+        logger.info(f"[OCR] pdf2image: {len(pages)} 페이지 변환 완료")
+        return pages
+    except Exception as e:
+        logger.error(f"[OCR] pdf2image 실패: {e}")
+
+    return []
+
+
+def _extract_text_ocr(file_path: str) -> str:
+    """OCR fallback: PyMuPDF/pdf2image → pytesseract"""
+    try:
         import pytesseract
 
-        poppler_path, available_langs = _setup_ocr_env()
+        _, available_langs = _setup_ocr_env()
 
-        # pdf → 이미지 변환
-        try:
-            pages = convert_from_path(file_path, dpi=200, poppler_path=poppler_path)
-        except Exception as e:
-            logger.error(f"[OCR] pdf2image 변환 실패: {e}")
-            return ""
-
+        pages = _pdf_to_images(file_path)
         if not pages:
-            logger.warning(f"[OCR] 페이지 없음: {file_path}")
+            logger.error(f"[OCR] PDF→이미지 변환 실패: {file_path}")
             return ""
 
-        # 언어 후보 목록 (설치된 언어에 따라 동적으로 결정)
-        lang_candidates: List[str] = []
-        if "jpn" in available_langs and "kor" in available_langs and "eng" in available_langs:
+        # 언어 후보 (설치된 tessdata 기준)
+        if "jpn" in available_langs and "kor" in available_langs:
             lang_candidates = ["jpn+kor+eng", "jpn+eng", "eng"]
-        elif "jpn" in available_langs and "eng" in available_langs:
+        elif "jpn" in available_langs:
             lang_candidates = ["jpn+eng", "eng"]
-        elif "eng" in available_langs:
-            lang_candidates = ["eng"]
+        elif available_langs:
+            lang_candidates = ["+".join(available_langs), "eng"]
         else:
-            # 설치된 언어가 없으면 env fallback
             lang_candidates = ["jpn+kor+eng", "jpn+eng", "eng"]
 
         texts: List[str] = []
@@ -241,7 +274,7 @@ def _extract_text_ocr(file_path: str) -> str:
                     continue
 
         result_text = "\n\n".join(texts)
-        logger.info(f"[OCR] 추출 완료: {len(result_text)} chars, langs={lang_candidates}")
+        logger.info(f"[OCR] 완료: {len(result_text)} chars, langs={lang_candidates}")
         return result_text
 
     except Exception as e:
