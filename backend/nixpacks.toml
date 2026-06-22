@@ -1,11 +1,17 @@
 [phases.setup]
-nixPkgs = ["python311", "gcc", "libpq", "tesseract", "poppler_utils", "liberation_ttf"]
+nixPkgs = ["python311", "gcc", "libpq", "tesseract", "poppler_utils", "liberation_ttf", "wget"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = [
+  "pip install -r requirements.txt",
+  "mkdir -p /app/tessdata",
+  "wget -q -O /app/tessdata/eng.traineddata 'https://github.com/tesseract-ocr/tessdata/raw/main/eng.traineddata' || echo '[tessdata] eng skip'",
+  "wget -q -O /app/tessdata/jpn.traineddata 'https://github.com/tesseract-ocr/tessdata/raw/main/jpn.traineddata' || echo '[tessdata] jpn skip'",
+  "wget -q -O /app/tessdata/kor.traineddata 'https://github.com/tesseract-ocr/tessdata/raw/main/kor.traineddata' || echo '[tessdata] kor skip'"
+]
 
 [phases.build]
 cmds = []
 
 [start]
-cmd = "sh -c 'uvicorn app.main:app --host 0.0.0.0 --port $PORT'"
+cmd = "sh -c 'TESSDATA_PREFIX=/app/tessdata uvicorn app.main:app --host 0.0.0.0 --port $PORT'"

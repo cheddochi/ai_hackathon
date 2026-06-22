@@ -6,9 +6,12 @@ PDF Profit Sheet 파서 (rule-based, LLM 없음)
    - H.B/L NO 를 식별자로 사용
    - REVENUE OF HOUSE B/L / EXPENSE OF MASTER B/L 섹션 추출
 """
+import os
 import re
+import glob
 import json
 import logging
+import shutil
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 import pdfplumber
@@ -136,18 +139,94 @@ def _extract_text_pdfplumber(file_path: str) -> str:
     return "\n\n".join(texts)
 
 
+def _setup_ocr_env() -> tuple:
+    """
+    Railway(Nix) 환경에서 poppler / tesseract 경로를 동적으로 탐지한다.
+    Returns: (poppler_path | None, available_langs: list[str])
+    """
+    # ── 1. poppler (pdftoppm) 경로 탐지 ──────────────────────────
+    pdftoppm = shutil.which("pdftoppm")
+    poppler_path = os.path.dirname(pdftoppm) if pdftoppm else None
+    logger.info(f"[OCR-setup] pdftoppm={pdftoppm}, poppler_path={poppler_path}")
+
+    # ── 2. tesseract 바이너리 경로 탐지 ──────────────────────────
+    try:
+        import pytesseract
+        tess_bin = shutil.which("tesseract")
+        if tess_bin:
+            pytesseract.pytesseract.tesseract_cmd = tess_bin
+            logger.info(f"[OCR-setup] tesseract_cmd={tess_bin}")
+    except ImportError:
+        pass
+
+    # ── 3. TESSDATA_PREFIX 자동 설정 ──────────────────────────────
+    tessdata_prefix = os.environ.get("TESSDATA_PREFIX", "")
+    if not tessdata_prefix or not os.path.isdir(tessdata_prefix):
+        # 우선순위: 1) /app/tessdata (nixpacks 빌드 시 다운로드 위치)
+        #            2) Nix store 내 eng.traineddata 폴더
+        for candidate in [
+            "/app/tessdata",
+            "/tessdata",
+        ]:
+            if os.path.isfile(os.path.join(candidate, "eng.traineddata")):
+                tessdata_prefix = candidate
+                break
+
+        if not tessdata_prefix:
+            nix_paths = glob.glob("/nix/store/*/share/tessdata/eng.traineddata")
+            if nix_paths:
+                tessdata_prefix = os.path.dirname(nix_paths[0])
+
+        if tessdata_prefix:
+            os.environ["TESSDATA_PREFIX"] = tessdata_prefix
+            logger.info(f"[OCR-setup] TESSDATA_PREFIX={tessdata_prefix}")
+
+    # ── 4. 사용 가능한 언어 확인 ─────────────────────────────────
+    available_langs: list = []
+    if tessdata_prefix and os.path.isdir(tessdata_prefix):
+        for lang in ("jpn", "kor", "eng"):
+            td = os.path.join(tessdata_prefix, f"{lang}.traineddata")
+            if os.path.isfile(td):
+                available_langs.append(lang)
+    logger.info(f"[OCR-setup] available_langs={available_langs}")
+
+    return poppler_path, available_langs
+
+
 def _extract_text_ocr(file_path: str) -> str:
     """OCR fallback: pdf2image → pytesseract"""
     try:
         from pdf2image import convert_from_path
         import pytesseract
 
-        pages = convert_from_path(file_path, dpi=250)
-        texts: List[str] = []
+        poppler_path, available_langs = _setup_ocr_env()
 
+        # pdf → 이미지 변환
+        try:
+            pages = convert_from_path(file_path, dpi=200, poppler_path=poppler_path)
+        except Exception as e:
+            logger.error(f"[OCR] pdf2image 변환 실패: {e}")
+            return ""
+
+        if not pages:
+            logger.warning(f"[OCR] 페이지 없음: {file_path}")
+            return ""
+
+        # 언어 후보 목록 (설치된 언어에 따라 동적으로 결정)
+        lang_candidates: List[str] = []
+        if "jpn" in available_langs and "kor" in available_langs and "eng" in available_langs:
+            lang_candidates = ["jpn+kor+eng", "jpn+eng", "eng"]
+        elif "jpn" in available_langs and "eng" in available_langs:
+            lang_candidates = ["jpn+eng", "eng"]
+        elif "eng" in available_langs:
+            lang_candidates = ["eng"]
+        else:
+            # 설치된 언어가 없으면 env fallback
+            lang_candidates = ["jpn+kor+eng", "jpn+eng", "eng"]
+
+        texts: List[str] = []
         for page_img in pages:
-            # jpn+eng 우선, 실패하면 eng만
-            for lang in ("jpn+kor+eng", "jpn+eng", "eng"):
+            for lang in lang_candidates:
                 try:
                     text = pytesseract.image_to_string(
                         page_img,
@@ -157,13 +236,16 @@ def _extract_text_ocr(file_path: str) -> str:
                     if text.strip():
                         texts.append(text)
                         break
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"[OCR] lang={lang} 실패: {e}")
                     continue
 
-        return "\n\n".join(texts)
+        result_text = "\n\n".join(texts)
+        logger.info(f"[OCR] 추출 완료: {len(result_text)} chars, langs={lang_candidates}")
+        return result_text
 
     except Exception as e:
-        logger.error(f"[pdf_parser] OCR failed: {e}")
+        logger.error(f"[pdf_parser] OCR 전체 실패: {e}", exc_info=True)
         return ""
 
 
