@@ -1,394 +1,495 @@
 """
 PDF Profit Sheet 파서 (rule-based, LLM 없음)
-pdfplumber를 이용해 텍스트 추출 후 정규식 기반 구조화
+1. pdfplumber로 텍스트 추출 시도
+2. 텍스트 없으면 pdf2image + pytesseract OCR fallback
+3. PROFIT/LOSS SHEET 규격 rule-based 파싱
+   - H.B/L NO 를 식별자로 사용
+   - REVENUE OF HOUSE B/L / EXPENSE OF MASTER B/L 섹션 추출
 """
 import re
+import json
+import logging
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 import pdfplumber
 
+logger = logging.getLogger(__name__)
 
-# ─── 파싱 결과 데이터 클래스 ───────────────────────────────
+
+# ─── 파싱 결과 데이터 클래스 ──────────────────────────────────
+
 @dataclass
 class ParsedCharge:
     charge_code: str
     charge_name: str
-    is_revenue: bool        # True=매출, False=매입
-    currency: str
-    amount: float
-    partner_name: str = ""
-    quantity: float = 1.0
-    unit: str = ""
-    confidence: float = 1.0  # 파싱 신뢰도 (0~1)
+    is_revenue: bool       # True=매출(REVENUE), False=매입(EXPENSE)
+    currency: str          # JPY / USD / KRW
+    amount: float          # 외화 금액 (JPY인 경우 0)
+    amount_jpy: float      # JPY 환산 금액
+    ex_rate: float = 0.0
+    account_name: str = "" # ACCOUNT CUST 명
+    confidence: float = 1.0
 
 
 @dataclass
 class ParsedProfitSheet:
-    case_no: str = ""
-    customer_name: str = ""
-    job_code: str = ""
-    assignee_name: str = ""
-    origin_port: str = ""
-    dest_port: str = ""
-    partner_name: str = ""
+    # 식별자
+    hbl_no: str = ""       # H.B/L NO (House B/L Number) - 계약 식별자
+    mbl_no: str = ""       # M.B/L NO (Master B/L)
+    ref_no: str = ""       # REF NO
+    # 선적 정보
+    vessel_voy: str = ""
+    etd: str = ""
+    eta: str = ""
+    pol: str = ""          # Port of Loading
+    pod: str = ""          # Port of Discharge
     weight_kg: Optional[float] = None
     cbm: Optional[float] = None
-    container_type: str = ""
-    base_currency: str = "JPY"
+    r_ton: Optional[float] = None
+    cntr_info: str = ""    # Container Info
+    partner: str = ""      # 지불처 / PARTNER
+    # 거래처
+    customer_name: str = ""
+    assignee_name: str = ""
+    # 환율
+    ex_rate_usd: float = 0.0
+    # Profit/Loss 합계
+    profit_usd: float = 0.0
+    profit_jpy: float = 0.0
+    profit_tot_jpy: float = 0.0
+    # 비용 항목
     charges: List[ParsedCharge] = field(default_factory=list)
+    # 메타
     raw_text: str = ""
+    is_ocr: bool = False
     parse_warnings: List[str] = field(default_factory=list)
+    confidence: float = 1.0
+
+    # ── 하위 호환 프로퍼티 ──
+    @property
+    def case_no(self) -> str:
+        return self.hbl_no or self.ref_no
+
+    @property
+    def origin_port(self) -> str:
+        return self.pol
+
+    @property
+    def dest_port(self) -> str:
+        return self.pod
+
+    @property
+    def job_code(self) -> str:
+        return _infer_job_code(self.pol, self.pod)
+
+    @property
+    def container_type(self) -> str:
+        return self.cntr_info
+
+    @property
+    def base_currency(self) -> str:
+        return "JPY"
+
+    @property
+    def partner_name(self) -> str:
+        return self.partner
 
 
-# ─── 알려진 비용 항목 코드 매핑 ──────────────────────────
-KNOWN_CHARGES = {
-    # 해상
-    "OF": ("Ocean Freight", "SEA"),
-    "THC": ("Terminal Handling Charge", "SEA"),
-    "BAF": ("Bunker Adjustment Factor", "SEA"),
-    "WAF": ("Fuel Surcharge", "SEA"),
-    "CIC": ("Container Imbalance Charge", "SEA"),
-    "EBS": ("Emergency Bunker Surcharge", "SEA"),
-    "CRS": ("Container Recovery Surcharge", "SEA"),
-    "EFS": ("Environmental Fuel Surcharge", "SEA"),
-    # 서류
-    "DOC": ("Document Fee", "ALL"),
-    "BL": ("Bill of Lading Fee", "SEA"),
-    "DO": ("Delivery Order Fee", "SEA"),
-    "SEAL": ("Seal Charge", "SEA"),
-    # 수출
-    "AFR": ("Advance Filing Rules", "ALL"),
-    "AMS": ("Automated Manifest System", "SEA"),
-    "ENS": ("Entry Summary Declaration", "ALL"),
-    "ISPS": ("Port Security Fee", "SEA"),
-    # 수입
-    "DUTY": ("관세", "ALL"),
-    "VAT": ("소비세", "ALL"),
-    "FOOD": ("식품신고", "ALL"),
-    "QUARANTINE": ("검역", "ALL"),
-    "INSPECTION": ("검사", "ALL"),
-    # 운송
-    "DRAYAGE": ("컨테이너 운송", "ALL"),
-    "HIGHWAY": ("고속도로비", "ALL"),
-    "DELIVERY": ("배송비", "ALL"),
-    # 창고
-    "STORAGE": ("보관료", "ALL"),
-    "DEVAN": ("데반닝", "ALL"),
-    "VANNING": ("바닝", "ALL"),
-    "PICKING": ("피킹", "ALL"),
-    "LABELING": ("라벨링", "ALL"),
-    "HANDLING": ("작업료", "ALL"),
-    # 항공
-    "AF": ("Air Freight", "AIR"),
-    "FSC": ("Fuel Surcharge", "AIR"),
-    "SSC": ("Security Surcharge", "AIR"),
-    "AWB": ("Air Waybill Fee", "AIR"),
-}
+# ─── 유틸 ────────────────────────────────────────────────────
 
-CURRENCY_PATTERNS = {
-    "JPY": [r"¥", r"JPY", r"円", r"¥"],
-    "USD": [r"\$", r"USD"],
-    "KRW": [r"KRW", r"원", r"₩"],
-    "EUR": [r"EUR", r"€"],
-}
-
-AMOUNT_PATTERN = re.compile(
-    r"([\$¥₩€]?\s*[\d,]+(?:\.\d{1,2})?)\s*(JPY|USD|KRW|EUR|円|¥|\$|₩|€)?",
-    re.IGNORECASE,
-)
-
-JOB_CODE_PATTERN = re.compile(
-    r"\b(SE\+{0,3}|SI\+{0,3}|AE\+{0,3}|AI\+{0,3}|PJT)\b",
-    re.IGNORECASE,
-)
-
-REVENUE_KEYWORDS = ["売上", "REVENUE", "SALES", "CHARGE TO", "매출", "수입"]
-COST_KEYWORDS = ["仕入", "COST", "PURCHASE", "PAYABLE", "매입", "원가", "支払"]
-
-
-def parse_pdf(file_path: str) -> ParsedProfitSheet:
-    """PDF 파일을 파싱하여 ParsedProfitSheet 반환"""
-    result = ParsedProfitSheet()
-
+def _parse_float(s: str) -> float:
     try:
-        with pdfplumber.open(file_path) as pdf:
-            all_text = ""
-            all_tables = []
+        return float(re.sub(r'[,\s]', '', str(s)))
+    except (ValueError, AttributeError):
+        return 0.0
 
-            for page in pdf.pages:
-                text = page.extract_text() or ""
-                all_text += text + "\n"
-                tables = page.extract_tables()
-                if tables:
-                    all_tables.extend(tables)
 
-        result.raw_text = all_text
+def _infer_job_code(pol: str, pod: str) -> str:
+    """POL/POD에서 업무코드 추론"""
+    pol_u = (pol or "").upper()
+    pod_u = (pod or "").upper()
+    kr_ports = ["BUSAN", "INCHEON", "KOREA"]
+    jp_ports = ["TOKYO", "OSAKA", "NAGOYA", "YOKOHAMA", "KOBE", "FUKUOKA", "JAPAN"]
+    pol_kr = any(p in pol_u for p in kr_ports)
+    pol_jp = any(p in pol_u for p in jp_ports)
+    pod_kr = any(p in pod_u for p in kr_ports)
+    pod_jp = any(p in pod_u for p in jp_ports)
 
-        # 메타 정보 추출
-        result.case_no = _extract_case_no(all_text)
-        result.customer_name = _extract_customer(all_text)
-        result.job_code = _extract_job_code(all_text)
-        result.assignee_name = _extract_assignee(all_text)
-        result.origin_port, result.dest_port = _extract_ports(all_text)
-        result.weight_kg = _extract_weight(all_text)
-        result.cbm = _extract_cbm(all_text)
-        result.container_type = _extract_container_type(all_text)
-        result.base_currency = _detect_base_currency(all_text)
+    if pol_kr and pod_jp:
+        return "SI"   # 한국 → 일본 수입
+    if pol_jp and pod_kr:
+        return "SE"   # 일본 → 한국 수출
+    if pol_jp:
+        return "AE"   # 일본에서 수출
+    return "SE"
 
-        # 테이블에서 매출/매입 항목 추출
-        if all_tables:
-            charges = _parse_tables(all_tables, all_text)
-            result.charges = charges
-        else:
-            # 테이블 없으면 텍스트 기반 파싱
-            charges = _parse_text_charges(all_text)
-            result.charges = charges
 
-        if not result.charges:
-            result.parse_warnings.append("비용 항목을 추출하지 못했습니다. 수동 입력이 필요합니다.")
+# ─── 텍스트 추출 ─────────────────────────────────────────────
+
+def _extract_text_pdfplumber(file_path: str) -> str:
+    texts: List[str] = []
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                texts.append(t)
+    return "\n\n".join(texts)
+
+
+def _extract_text_ocr(file_path: str) -> str:
+    """OCR fallback: pdf2image → pytesseract"""
+    try:
+        from pdf2image import convert_from_path
+        import pytesseract
+
+        pages = convert_from_path(file_path, dpi=250)
+        texts: List[str] = []
+
+        for page_img in pages:
+            # jpn+eng 우선, 실패하면 eng만
+            for lang in ("jpn+kor+eng", "jpn+eng", "eng"):
+                try:
+                    text = pytesseract.image_to_string(
+                        page_img,
+                        lang=lang,
+                        config="--psm 6 --oem 3",
+                    )
+                    if text.strip():
+                        texts.append(text)
+                        break
+                except Exception:
+                    continue
+
+        return "\n\n".join(texts)
 
     except Exception as e:
-        result.parse_warnings.append(f"PDF 파싱 오류: {str(e)}")
+        logger.error(f"[pdf_parser] OCR failed: {e}")
+        return ""
+
+
+# ─── 헤더 파싱 ───────────────────────────────────────────────
+
+def _extract_header(text: str) -> dict:
+    result: dict = {}
+
+    def _find(pattern: str, group: int = 1) -> str:
+        m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        return m.group(group).strip() if m else ""
+
+    result['ref_no']       = _find(r'REF\s*NO\s*\.?\s*:\s*([A-Z0-9\-]{4,30})')
+    result['mbl_no']       = _find(r'M\s*\.?\s*B/?L\s*NO\s*\.?\s*:\s*([A-Z0-9\-]{4,30})')
+    result['vessel_voy']   = _find(r'VESSEL\s*/\s*VOY\s*:\s*(.+?)(?:\s{3,}|\n|$)')
+    result['assignee_name']= _find(r'(?:出力担当者|担当者)\s*:\s*([A-Z][A-Z\.\s]+?)(?:\s+PRINT|\n|$)')
+
+    # ETD / ETA
+    m = re.search(r'ETD\s*/\s*ETA\s*:\s*([\d\-/]+)\s*/\s*([\d\-/]+)', text, re.IGNORECASE)
+    result['etd'] = m.group(1).strip() if m else ""
+    result['eta'] = m.group(2).strip() if m else ""
+
+    # POL / POD  (일본어 앞에 영어 항구명이 오는 형식)
+    result['pol'] = _find(r'POL\s*:\s*([A-Z][A-Z,\.\s]+?)(?:\s{3,}|\n|$)')
+    result['pod'] = _find(r'POD\s*:\s*([A-Z][A-Z,\.\s]+?)(?:\s{3,}|\n|$)')
+
+    # WEIGHT / CBM
+    m = re.search(r'WEIGHT\s*:\s*([\d,\.]+)\s*KGS?', text, re.IGNORECASE)
+    result['weight_kg'] = _parse_float(m.group(1)) if m else None
+
+    m = re.search(r'CBM\s*:\s*([\d,\.]+)\s*CBM', text, re.IGNORECASE)
+    result['cbm'] = _parse_float(m.group(1)) if m else None
+
+    result['cntr_info'] = _find(r'CNTR\s*INFO\s*:\s*(.+?)(?:\s{3,}|\n|$)')
+
+    # PARTNER (지불처) - 두 가지 표기
+    partner = _find(r'PARTNER\s*:\s*(.+?)(?:\s{3,}|\n|$)')
+    if not partner:
+        partner = _find(r'支払先\s*:\s*(.+?)(?:\s{3,}|\n|$)')
+    result['partner'] = partner
 
     return result
 
 
-def _extract_case_no(text: str) -> str:
-    patterns = [
-        r"(?:Case\s*No|안건번호|案件番号)[:\s#]*([\w\-/]+)",
-        r"(?:B/L No|BL No)[:\s]*([\w\-/]+)",
-        r"(?:JOB|Job)[:\s#]*([\w\-/]+)",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, text, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-    return ""
+# ─── H.B/L NO + R/TON + Customer 추출 ──────────────────────
 
+def _extract_hbl_info(text: str) -> Tuple[str, str, float]:
+    """H.B/L NO, customer_name, R/TON 추출"""
+    hbl_no = ""
+    customer_name = ""
+    r_ton = 0.0
 
-def _extract_customer(text: str) -> str:
-    patterns = [
-        r"(?:Customer|Shipper|荷主|거래처)[:\s]*([\w\s\-\.]+?)(?:\n|,|;)",
-        r"(?:CONSIGNEE|SHIPPER)[:\s]*([\w\s\-\.]+?)(?:\n)",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, text, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-    return ""
-
-
-def _extract_job_code(text: str) -> str:
-    m = JOB_CODE_PATTERN.search(text)
-    return m.group(1).upper() if m else ""
-
-
-def _extract_assignee(text: str) -> str:
-    patterns = [
-        r"(?:担当者|담당자|Assignee|担当)[:\s]*([\w\s]+?)(?:\n|,)",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, text, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-    return ""
-
-
-def _extract_ports(text: str) -> Tuple[str, str]:
-    origin, dest = "", ""
-    # PORT 패턴: "FROM TOKYO" or "ORIGIN: TOKYO"
-    m_origin = re.search(r"(?:FROM|ORIGIN|POL|出発)[:\s]*([\w\s]+?)(?:\n|→|->|TO|DEST)", text, re.IGNORECASE)
-    m_dest = re.search(r"(?:TO|DEST|DESTINATION|POD|到着)[:\s]*([\w\s]+?)(?:\n|,)", text, re.IGNORECASE)
-    if m_origin:
-        origin = m_origin.group(1).strip().upper()
-    if m_dest:
-        dest = m_dest.group(1).strip().upper()
-    return origin, dest
-
-
-def _extract_weight(text: str) -> Optional[float]:
-    m = re.search(r"(?:Weight|重量|G\.W)[:\s]*([\d,\.]+)\s*(?:KG|kg|K)", text, re.IGNORECASE)
+    # 방법 1: summary 테이블 데이터 행 — HBL이 R/TON 앞에 있음
+    # 패턴: "HBLCODE  R/TON_VALUE |USD|"
+    m = re.search(
+        r'^([A-Z0-9]{6,20})\s+([\d,\.]+)\s*[|]?USD',
+        text,
+        re.MULTILINE,
+    )
     if m:
-        return float(m.group(1).replace(",", ""))
-    return None
-
-
-def _extract_cbm(text: str) -> Optional[float]:
-    m = re.search(r"(?:CBM|M3|Volume|容積)[:\s]*([\d,\.]+)", text, re.IGNORECASE)
-    if m:
-        return float(m.group(1).replace(",", ""))
-    return None
-
-
-def _extract_container_type(text: str) -> str:
-    patterns = [r"\b(20GP|40GP|40HC|20RF|40RF|LCL|BULK)\b"]
-    for pattern in patterns:
-        m = re.search(pattern, text, re.IGNORECASE)
+        hbl_no = m.group(1).strip()
+        r_ton  = _parse_float(m.group(2))
+    else:
+        # 방법 2: H.B/L NO 레이블 뒤
+        m = re.search(r'H\.?\s*B/?L\s*NO[.\s]*:?\s*([A-Z0-9]{6,20})', text, re.IGNORECASE)
         if m:
-            return m.group(1).upper()
-    return ""
+            hbl_no = m.group(1).strip()
+
+    # Customer name: HBL 이후 3번째 줄 내에서 숫자/기호 아닌 텍스트
+    if hbl_no:
+        idx = text.find(hbl_no)
+        if idx >= 0:
+            after_lines = text[idx:idx + 400].split('\n')
+            for line in after_lines[1:5]:
+                line = line.strip()
+                if not line:
+                    continue
+                # 날짜, 숫자, 통화코드만 있는 줄 스킵
+                if re.match(r'^[\d\-/|JPYUSD\s,\.\[\]]+$', line):
+                    continue
+                # 섹션 헤더 스킵
+                if any(kw in line.upper() for kw in
+                       ['TOTAL', 'REVENUE', 'EXPENSE', 'PROFIT', 'PARTNER', 'ACCOUNT']):
+                    continue
+                if len(line) > 2:
+                    customer_name = line
+                    break
+
+    return hbl_no, customer_name, r_ton
 
 
-def _detect_base_currency(text: str) -> str:
-    counts = {currency: 0 for currency in CURRENCY_PATTERNS}
-    for currency, patterns in CURRENCY_PATTERNS.items():
-        for pattern in patterns:
-            counts[currency] += len(re.findall(pattern, text))
-    return max(counts, key=counts.get) if any(counts.values()) else "JPY"
+# ─── 환율 추출 ───────────────────────────────────────────────
+
+def _extract_ex_rate(text: str) -> float:
+    """USD/JPY 환율 추출"""
+    # "USD 160.5600" or "USD 160.5600JPY" 패턴
+    m = re.search(r'USD\s+(1[0-9]{2}\.[0-9]{2,4})', text)
+    if m:
+        return _parse_float(m.group(1))
+    return 0.0
 
 
-def _parse_tables(tables: list, full_text: str) -> List[ParsedCharge]:
-    """테이블 구조에서 매출/매입 항목 추출"""
-    charges = []
+# ─── 비용 항목 추출 ──────────────────────────────────────────
 
-    for table in tables:
-        if not table or len(table) < 2:
-            continue
+def _parse_charge_line(line: str) -> Optional[ParsedCharge]:
+    """
+    단일 비용 항목 줄 파싱
+    형식: CODE  DESCRIPTION  CURRENCY  EXRATE  amounts...
+    예시:
+      BF BAF USD 160.5600 310.00 49,774 310.00 49,774
+      TH THC JPY 160.5600 52,000 52,000
+      CC CUSTOMS CLEARANCE FEE JPY 160.5600 11,800 11,800
+    """
+    line = line.strip()
+    if not line:
+        return None
 
-        # 헤더 행 찾기
-        header_row = table[0] if table[0] else []
-        header_text = " ".join([str(cell or "") for cell in header_row]).upper()
+    # CODE: 2~5 대문자
+    m = re.match(
+        r'^([A-Z]{2,5})\s+(.+?)\s+(JPY|USD|KRW)\s+([\d,\.]+)\s+([\d\.,\s\|\-]+)$',
+        line,
+    )
+    if not m:
+        return None
 
-        # 매출/매입 구분 컬럼 인덱스 추정
-        rev_col, cost_col = _find_revenue_cost_cols(header_row)
+    code      = m.group(1).upper()
+    name      = m.group(2).strip()
+    currency  = m.group(3).upper()
+    ex_rate   = _parse_float(m.group(4))
+    nums_str  = m.group(5)
 
-        for row in table[1:]:
-            if not row or not any(row):
-                continue
+    # 숫자 추출 (콤마 제거 후)
+    raw_nums = re.findall(r'-?[\d]+(?:,[\d]{3})*(?:\.[\d]+)?', nums_str)
+    nums = [_parse_float(n) for n in raw_nums if n.replace(',', '').replace('.', '').replace('-', '')]
+    nums = [n for n in nums if n != 0.0]
 
-            row_text = " ".join([str(cell or "") for cell in row])
+    if not nums:
+        return None
 
-            # 비용 코드 감지
-            charge_code, charge_name = _detect_charge_code(row_text)
-            if not charge_code:
-                continue
+    if currency == 'JPY':
+        amount_jpy = nums[-1]
+        amount     = 0.0
+    else:  # USD / KRW
+        # 외화(작은 수) vs JPY(큰 수) 구분
+        small = [n for n in nums if abs(n) < 10_000]
+        large = [n for n in nums if abs(n) >= 1_000]
+        amount     = small[-1] if small else nums[0]
+        amount_jpy = large[-1] if large else (abs(amount) * ex_rate if ex_rate else 0.0)
 
-            # 금액 추출
-            is_revenue, amount, currency = _extract_amount_from_row(
-                row, rev_col, cost_col, row_text
-            )
+    return ParsedCharge(
+        charge_code  = code,
+        charge_name  = name,
+        is_revenue   = True,   # caller가 덮어씀
+        currency     = currency,
+        amount       = amount,
+        amount_jpy   = amount_jpy,
+        ex_rate      = ex_rate,
+        confidence   = 0.9,
+    )
 
-            if amount and amount > 0:
-                charges.append(ParsedCharge(
-                    charge_code=charge_code,
-                    charge_name=charge_name,
-                    is_revenue=is_revenue,
-                    currency=currency,
-                    amount=amount,
-                    confidence=0.8,
-                ))
+
+def _extract_charges(text: str) -> List[ParsedCharge]:
+    """REVENUE / EXPENSE 섹션에서 전체 비용 항목 추출"""
+    charges: List[ParsedCharge] = []
+
+    # 섹션 경계 찾기
+    rev_m = re.search(
+        r'REVENUE\s+OF\s+HOUSE\s+B/L(.+?)(?=EXPENSE\s+OF\s+MASTER|PARTNER\s+CLEARANCE|'
+        r'PROFIT\s+USD|\Z)',
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    exp_m = re.search(
+        r'EXPENSE\s+OF\s+MASTER\s+B/L(.+?)(?=PARTNER\s+CLEARANCE|PROFIT\s+USD|\Z)',
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    if rev_m:
+        charges.extend(_parse_section(rev_m.group(1), is_revenue=True))
+    if exp_m:
+        charges.extend(_parse_section(exp_m.group(1), is_revenue=False))
 
     return charges
 
 
-def _find_revenue_cost_cols(header_row: list) -> Tuple[int, int]:
-    rev_col, cost_col = -1, -1
-    for i, cell in enumerate(header_row):
-        cell_str = str(cell or "").upper()
-        if any(kw in cell_str for kw in ["REVENUE", "SELL", "売上", "CHARGE"]):
-            rev_col = i
-        if any(kw in cell_str for kw in ["COST", "BUY", "仕入", "PURCHASE"]):
-            cost_col = i
-    return rev_col, cost_col
+def _parse_section(section: str, is_revenue: bool) -> List[ParsedCharge]:
+    """섹션 텍스트에서 비용 항목 파싱"""
+    charges: List[ParsedCharge] = []
+    current_account = ""
+
+    for line in section.split('\n'):
+        line_s = line.strip()
+        if not line_s:
+            continue
+
+        # ACCOUNT CUST
+        m = re.match(r'ACCOUNT\s+CUST\s*:\s*(.+)', line_s, re.IGNORECASE)
+        if m:
+            current_account = m.group(1).strip()
+            continue
+
+        # SUB TOTAL / TOTAL 스킵
+        if re.match(r'^(SUB\s+)?TOTAL\b', line_s, re.IGNORECASE):
+            continue
+        if re.match(r'^ITEM\b', line_s, re.IGNORECASE):
+            continue
+
+        parsed = _parse_charge_line(line_s)
+        if parsed:
+            parsed.is_revenue  = is_revenue
+            parsed.account_name = current_account
+            charges.append(parsed)
+
+    return charges
 
 
-def _detect_charge_code(text: str) -> Tuple[str, str]:
-    text_upper = text.upper()
-    for code, (name, _) in KNOWN_CHARGES.items():
-        if re.search(r"\b" + re.escape(code) + r"\b", text_upper):
-            return code, name
-    return "", ""
+# ─── Profit 합계 추출 ────────────────────────────────────────
+
+def _extract_profit(text: str) -> Tuple[float, float, float]:
+    profit_usd    = 0.0
+    profit_jpy    = 0.0
+    profit_tot_jpy = 0.0
+
+    m = re.search(r'PROFIT\s+USD\s+([-\d,\.]+)', text, re.IGNORECASE)
+    if m:
+        profit_usd = _parse_float(m.group(1))
+
+    # "PROFIT USD xxx\nJPY yyy" or "JPY yyy" after PROFIT line
+    m = re.search(
+        r'PROFIT\s+USD\s+[-\d,\.]+\s*\n\s*(?:JPY\s+)?([-\d,\.]+)',
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        profit_jpy = _parse_float(m.group(1))
+
+    m = re.search(r'TOT\(J\)\s+([-\d,\.]+)', text, re.IGNORECASE)
+    if m:
+        profit_tot_jpy = _parse_float(m.group(1))
+
+    return profit_usd, profit_jpy, profit_tot_jpy
 
 
-def _extract_amount_from_row(
-    row: list, rev_col: int, cost_col: int, row_text: str
-) -> Tuple[bool, float, str]:
-    """행에서 금액과 매출/매입 구분 추출"""
-    currency = "JPY"
+# ─── 메인 함수 ───────────────────────────────────────────────
 
-    # 통화 감지
-    for cur, patterns in CURRENCY_PATTERNS.items():
-        if any(re.search(p, row_text, re.IGNORECASE) for p in patterns):
-            currency = cur
-            break
+def parse_pdf(file_path: str) -> ParsedProfitSheet:
+    """
+    PDF 파싱 메인 엔트리포인트
+    1. pdfplumber 시도
+    2. 텍스트 없으면 OCR fallback
+    3. PROFIT/LOSS SHEET rule-based 파싱
+    """
+    result = ParsedProfitSheet()
+    is_ocr = False
 
-    # 매출/매입 컬럼이 특정된 경우
-    if rev_col >= 0 and rev_col < len(row):
-        val = _parse_amount_str(str(row[rev_col] or ""))
-        if val and val > 0:
-            return True, val, currency
-
-    if cost_col >= 0 and cost_col < len(row):
-        val = _parse_amount_str(str(row[cost_col] or ""))
-        if val and val > 0:
-            return False, val, currency
-
-    # 컬럼 특정 불가 → 키워드로 판단
-    is_revenue = any(kw in row_text.upper() for kw in ["SELL", "REVENUE", "CHARGE"])
-
-    # 숫자 추출
-    amounts = AMOUNT_PATTERN.findall(row_text)
-    for amount_str, _ in amounts:
-        val = _parse_amount_str(amount_str)
-        if val and val > 0:
-            return is_revenue, val, currency
-
-    return is_revenue, 0.0, currency
-
-
-def _parse_amount_str(s: str) -> float:
-    cleaned = re.sub(r"[¥$₩€,\s]", "", s)
     try:
-        return float(cleaned)
-    except (ValueError, TypeError):
-        return 0.0
+        # ── Step 1: pdfplumber ──────────────────────────────
+        text = _extract_text_pdfplumber(file_path)
 
+        # ── Step 2: OCR fallback ─────────────────────────────
+        if not text or len(text.strip()) < 100:
+            logger.info(f"[pdf_parser] Falling back to OCR: {file_path}")
+            text = _extract_text_ocr(file_path)
+            is_ocr = True
 
-def _parse_text_charges(text: str) -> List[ParsedCharge]:
-    """테이블 없을 때 텍스트에서 비용 항목 추출"""
-    charges = []
-    lines = text.split("\n")
+        if not text or len(text.strip()) < 50:
+            result.parse_warnings.append("텍스트 추출 실패 (pdfplumber + OCR 모두 실패)")
+            result.confidence = 0.0
+            return result
 
-    current_section_is_revenue: Optional[bool] = None
+        result.raw_text = text
+        result.is_ocr   = is_ocr
 
-    for line in lines:
-        line_upper = line.upper().strip()
-        if not line_upper:
-            continue
+        # ── Step 3: PROFIT/LOSS SHEET 형식 확인 ─────────────
+        text_upper = text.upper()
+        if 'PROFIT' not in text_upper:
+            result.parse_warnings.append("PROFIT/LOSS SHEET 형식이 아닙니다.")
+            result.confidence = 0.2
+            return result
 
-        # 섹션 전환 감지
-        if any(kw in line_upper for kw in REVENUE_KEYWORDS):
-            current_section_is_revenue = True
-            continue
-        if any(kw in line_upper for kw in COST_KEYWORDS):
-            current_section_is_revenue = False
-            continue
+        # ── Step 4: 헤더 ─────────────────────────────────────
+        hdr = _extract_header(text)
+        result.ref_no        = hdr.get('ref_no', '')
+        result.mbl_no        = hdr.get('mbl_no', '')
+        result.vessel_voy    = hdr.get('vessel_voy', '')
+        result.etd           = hdr.get('etd', '')
+        result.eta           = hdr.get('eta', '')
+        result.pol           = hdr.get('pol', '')
+        result.pod           = hdr.get('pod', '')
+        result.weight_kg     = hdr.get('weight_kg')
+        result.cbm           = hdr.get('cbm')
+        result.cntr_info     = hdr.get('cntr_info', '')
+        result.partner       = hdr.get('partner', '')
+        result.assignee_name = hdr.get('assignee_name', '')
 
-        # 비용 코드 감지
-        charge_code, charge_name = _detect_charge_code(line)
-        if not charge_code:
-            continue
+        # ── Step 5: H.B/L NO ─────────────────────────────────
+        hbl_no, customer_name, r_ton = _extract_hbl_info(text)
+        result.hbl_no        = hbl_no
+        result.customer_name = customer_name
+        result.r_ton         = r_ton if r_ton else (
+            max(result.weight_kg / 1000.0, result.cbm)
+            if result.weight_kg and result.cbm else result.cbm
+        )
 
-        # 금액 추출
-        amounts = AMOUNT_PATTERN.findall(line)
-        currency = "JPY"
-        for cur, patterns in CURRENCY_PATTERNS.items():
-            if any(re.search(p, line, re.IGNORECASE) for p in patterns):
-                currency = cur
-                break
+        # ── Step 6: 환율 ─────────────────────────────────────
+        result.ex_rate_usd = _extract_ex_rate(text)
 
-        for amount_str, _ in amounts:
-            val = _parse_amount_str(amount_str)
-            if val and val > 0:
-                is_revenue = current_section_is_revenue if current_section_is_revenue is not None else True
-                charges.append(ParsedCharge(
-                    charge_code=charge_code,
-                    charge_name=charge_name,
-                    is_revenue=is_revenue,
-                    currency=currency,
-                    amount=val,
-                    confidence=0.6,  # 텍스트 기반 신뢰도 낮음
-                ))
-                break
+        # ── Step 7: 비용 항목 ────────────────────────────────
+        result.charges = _extract_charges(text)
 
-    return charges
+        # ── Step 8: Profit 합계 ──────────────────────────────
+        result.profit_usd, result.profit_jpy, result.profit_tot_jpy = _extract_profit(text)
+
+        # ── 신뢰도 계산 ─────────────────────────────────────
+        result.confidence = 0.7 if is_ocr else 0.9
+        if not result.hbl_no:
+            result.parse_warnings.append("H.B/L NO를 추출하지 못했습니다.")
+            result.confidence = max(0.1, result.confidence - 0.2)
+        if not result.charges:
+            result.parse_warnings.append("비용 항목 추출 실패. 수동 입력이 필요합니다.")
+            result.confidence = max(0.1, result.confidence - 0.2)
+
+    except Exception as exc:
+        logger.error(f"[pdf_parser] Unexpected error: {exc}", exc_info=True)
+        result.parse_warnings.append(f"파싱 오류: {exc}")
+        result.confidence = 0.0
+
+    return result

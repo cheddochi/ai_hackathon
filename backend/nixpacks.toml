@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["python311", "gcc", "libpq"]
+nixPkgs = ["python311", "gcc", "libpq", "tesseract", "poppler_utils", "liberation_ttf"]
 
 [phases.install]
 cmds = ["pip install -r requirements.txt"]

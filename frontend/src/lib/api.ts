@@ -56,6 +56,14 @@ export const profitSheetApi = {
       headers: { "Content-Type": "multipart/form-data" },
     });
   },
+  uploadPdfBulk: (files: File[]) => {
+    const form = new FormData();
+    files.forEach((f) => form.append("files", f));
+    return api.post("/profit-sheets/upload/pdf/bulk", form, {
+      headers: { "Content-Type": "multipart/form-data" },
+    });
+  },
+  delete: (id: number) => api.delete(`/profit-sheets/${id}`),
 };
 
 // ── Approval ───────────────────────────────────────────────

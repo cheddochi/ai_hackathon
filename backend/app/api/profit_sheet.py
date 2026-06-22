@@ -1,8 +1,9 @@
+import json
 import os
 import shutil
 import uuid
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -12,15 +13,16 @@ from app.models.user import User
 from app.models.transaction import ProfitSheetHeader, ProfitSheetDetail, InputMethod, ApprovalStatus
 from app.models.master import JobCodeMaster
 from app.schemas.transaction import ProfitSheetCreate, ProfitSheetOut, ProfitSheetListItem
-from app.services.pdf_parser import parse_pdf
+from app.services.pdf_parser import parse_pdf, ParsedProfitSheet
 from app.services.excel_parser import parse_excel
 from app.services.approval_engine import calculate_rt
 
 router = APIRouter(prefix="/profit-sheets", tags=["profit-sheet"])
 
 
+# ─── 내부 유틸 ───────────────────────────────────────────────
+
 def _calc_gp(header: ProfitSheetHeader) -> None:
-    """GP, GP율, RT 재계산"""
     header.rt = calculate_rt(header.weight_kg, header.cbm)
     header.gp_jpy = (header.total_revenue_jpy or 0) - (header.total_cost_jpy or 0)
     if header.total_revenue_jpy and header.total_revenue_jpy > 0:
@@ -40,7 +42,6 @@ def _get_exchange_rate(currency: str, header: ProfitSheetHeader) -> float:
 
 
 def _process_details(header: ProfitSheetHeader, details_data: list, db: Session) -> None:
-    """상세 항목 저장 및 GP 계산"""
     total_rev, total_cost = 0.0, 0.0
     for d in details_data:
         rate = _get_exchange_rate(d.currency, header)
@@ -54,9 +55,9 @@ def _process_details(header: ProfitSheetHeader, details_data: list, db: Session)
             amount=d.amount,
             amount_jpy=amount_jpy,
             partner_name=d.partner_name,
-            quantity=d.quantity,
-            unit=d.unit,
-            notes=d.notes,
+            quantity=getattr(d, 'quantity', 1.0),
+            unit=getattr(d, 'unit', None),
+            notes=getattr(d, 'notes', None),
         )
         db.add(detail)
         if d.is_revenue:
@@ -68,10 +69,87 @@ def _process_details(header: ProfitSheetHeader, details_data: list, db: Session)
     header.total_cost_jpy = total_cost
     _calc_gp(header)
 
-    # 생산성 포인트 자동 부여
     job = db.query(JobCodeMaster).filter(JobCodeMaster.code == header.job_code).first()
     header.point = job.point if job else 1.0
 
+
+def _parse_date(date_str: str):
+    """날짜 문자열 → datetime or None"""
+    if not date_str:
+        return None
+    import re
+    from datetime import datetime
+    # 형식: 2026-05-03 or 2026/05/03
+    m = re.match(r'(\d{4})[-/](\d{2})[-/](\d{2})', date_str.strip())
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    return None
+
+
+def _header_from_parsed(
+    parsed: ParsedProfitSheet,
+    current_user: User,
+    file_path: str,
+) -> ProfitSheetHeader:
+    """ParsedProfitSheet → ProfitSheetHeader 매핑"""
+    # 메타 정보를 notes JSON에 저장
+    notes_data: dict = {}
+    if parsed.mbl_no:
+        notes_data['mbl_no'] = parsed.mbl_no
+    if parsed.ref_no:
+        notes_data['ref_no'] = parsed.ref_no
+    if parsed.vessel_voy:
+        notes_data['vessel_voy'] = parsed.vessel_voy
+    if parsed.cntr_info:
+        notes_data['cntr_info'] = parsed.cntr_info
+    if parsed.profit_usd:
+        notes_data['profit_usd'] = parsed.profit_usd
+    if parsed.profit_tot_jpy:
+        notes_data['profit_tot_jpy'] = parsed.profit_tot_jpy
+    notes_data['is_ocr'] = parsed.is_ocr
+    notes_data['parse_confidence'] = parsed.confidence
+    if parsed.parse_warnings:
+        notes_data['warnings'] = parsed.parse_warnings
+
+    return ProfitSheetHeader(
+        case_no=parsed.hbl_no or parsed.ref_no or f"PDF-{uuid.uuid4().hex[:8].upper()}",
+        job_code=parsed.job_code or "SE",
+        customer_name=parsed.customer_name,
+        partner_name=parsed.partner,
+        assignee_id=current_user.id,
+        assignee_name=current_user.name,
+        origin_port=parsed.pol,
+        dest_port=parsed.pod,
+        etd=_parse_date(parsed.etd),
+        eta=_parse_date(parsed.eta),
+        weight_kg=parsed.weight_kg,
+        cbm=parsed.cbm,
+        rt=parsed.r_ton,
+        container_type=parsed.cntr_info,
+        base_currency="JPY",
+        exchange_rate_usd=parsed.ex_rate_usd or None,
+        input_method=InputMethod.PDF,
+        original_file_path=file_path,
+        status=ApprovalStatus.PENDING,
+        notes=json.dumps(notes_data, ensure_ascii=False) if notes_data else None,
+    )
+
+
+def _save_upload(file: UploadFile) -> str:
+    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+    file_path = os.path.join(
+        settings.UPLOAD_DIR,
+        f"{uuid.uuid4().hex}_{file.filename}",
+    )
+    with open(file_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    return file_path
+
+
+# ─── Routes ──────────────────────────────────────────────────
 
 @router.post("", response_model=ProfitSheetOut)
 def create_profit_sheet(
@@ -79,10 +157,8 @@ def create_profit_sheet(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    import re
-    case_no = data.case_no or f"CASE-{uuid.uuid4().hex[:8].upper()}"
     header = ProfitSheetHeader(
-        case_no=case_no,
+        case_no=data.case_no or f"CASE-{uuid.uuid4().hex[:8].upper()}",
         job_code=data.job_code,
         customer_id=data.customer_id,
         customer_name=data.customer_name,
@@ -120,45 +196,25 @@ async def upload_pdf(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if not file.filename.endswith(".pdf"):
+    if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="PDF 파일만 업로드 가능합니다")
 
-    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    file_path = os.path.join(settings.UPLOAD_DIR, f"{uuid.uuid4().hex}_{file.filename}")
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
+    file_path = _save_upload(file)
     parsed = parse_pdf(file_path)
 
-    header = ProfitSheetHeader(
-        case_no=parsed.case_no or f"PDF-{uuid.uuid4().hex[:8].upper()}",
-        job_code=parsed.job_code or "SE",
-        customer_name=parsed.customer_name,
-        assignee_id=current_user.id,
-        assignee_name=current_user.name,
-        origin_port=parsed.origin_port,
-        dest_port=parsed.dest_port,
-        weight_kg=parsed.weight_kg,
-        cbm=parsed.cbm,
-        container_type=parsed.container_type,
-        base_currency=parsed.base_currency,
-        input_method=InputMethod.PDF,
-        original_file_path=file_path,
-        status=ApprovalStatus.PENDING,
-        notes="; ".join(parsed.parse_warnings) if parsed.parse_warnings else None,
-    )
+    from app.schemas.transaction import ProfitSheetDetailCreate
+    header = _header_from_parsed(parsed, current_user, file_path)
     db.add(header)
     db.flush()
 
-    from app.schemas.transaction import ProfitSheetDetailCreate
     detail_creates = [
         ProfitSheetDetailCreate(
             charge_code=c.charge_code,
             charge_name=c.charge_name,
             is_revenue=c.is_revenue,
             currency=c.currency,
-            amount=c.amount,
-            partner_name=c.partner_name,
+            amount=c.amount if c.currency != "JPY" else c.amount_jpy,
+            partner_name=c.account_name,
         )
         for c in parsed.charges
     ]
@@ -168,20 +224,90 @@ async def upload_pdf(
     return header
 
 
+@router.post("/upload/pdf/bulk")
+async def upload_pdf_bulk(
+    files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    복수 PDF 업로드
+    반환: 파일별 결과 목록 [{filename, hbl_no, sheet_id, status, warnings}]
+    """
+    results = []
+
+    for file in files:
+        item: dict = {"filename": file.filename, "hbl_no": "", "sheet_id": None,
+                      "status": "error", "warnings": []}
+
+        if not file.filename.lower().endswith(".pdf"):
+            item["warnings"].append("PDF 파일이 아닙니다")
+            results.append(item)
+            continue
+
+        try:
+            file_path = _save_upload(file)
+            parsed = parse_pdf(file_path)
+
+            item["hbl_no"]   = parsed.hbl_no
+            item["warnings"] = parsed.parse_warnings
+
+            # 중복 체크 (같은 case_no)
+            case_no = parsed.hbl_no or parsed.ref_no
+            if case_no:
+                existing = db.query(ProfitSheetHeader).filter(
+                    ProfitSheetHeader.case_no == case_no
+                ).first()
+                if existing:
+                    item["status"]   = "duplicate"
+                    item["sheet_id"] = existing.id
+                    item["warnings"].append(f"이미 등록된 H.B/L NO입니다 (ID: {existing.id})")
+                    results.append(item)
+                    continue
+
+            from app.schemas.transaction import ProfitSheetDetailCreate
+            header = _header_from_parsed(parsed, current_user, file_path)
+            db.add(header)
+            db.flush()
+
+            detail_creates = [
+                ProfitSheetDetailCreate(
+                    charge_code=c.charge_code,
+                    charge_name=c.charge_name,
+                    is_revenue=c.is_revenue,
+                    currency=c.currency,
+                    amount=c.amount if c.currency != "JPY" else c.amount_jpy,
+                    partner_name=c.account_name,
+                )
+                for c in parsed.charges
+            ]
+            _process_details(header, detail_creates, db)
+            db.commit()
+            db.refresh(header)
+
+            item["sheet_id"] = header.id
+            item["status"]   = "success"
+
+        except Exception as exc:
+            db.rollback()
+            item["warnings"].append(f"처리 오류: {str(exc)}")
+            item["status"] = "error"
+
+        results.append(item)
+
+    return {"total": len(results), "results": results}
+
+
 @router.post("/upload/excel", response_model=ProfitSheetOut)
 async def upload_excel(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if not file.filename.endswith((".xlsx", ".xls")):
+    if not file.filename.lower().endswith((".xlsx", ".xls")):
         raise HTTPException(status_code=400, detail="Excel 파일만 업로드 가능합니다")
 
-    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    file_path = os.path.join(settings.UPLOAD_DIR, f"{uuid.uuid4().hex}_{file.filename}")
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
+    file_path = _save_upload(file)
     parsed = parse_excel(file_path)
 
     header = ProfitSheetHeader(
@@ -250,3 +376,18 @@ def get_profit_sheet(
     if not sheet:
         raise HTTPException(status_code=404, detail="Not found")
     return sheet
+
+
+@router.delete("/{sheet_id}")
+def delete_profit_sheet(
+    sheet_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    sheet = db.query(ProfitSheetHeader).filter(ProfitSheetHeader.id == sheet_id).first()
+    if not sheet:
+        raise HTTPException(status_code=404, detail="Not found")
+    db.query(ProfitSheetDetail).filter(ProfitSheetDetail.header_id == sheet_id).delete()
+    db.delete(sheet)
+    db.commit()
+    return {"ok": True}
