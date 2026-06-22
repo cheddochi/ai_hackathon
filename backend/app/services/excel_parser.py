@@ -5,7 +5,39 @@ openpyxl 기반으로 .xlsx 파일에서 매출/매입 항목 추출
 from dataclasses import dataclass, field
 from typing import List, Optional
 import openpyxl
-from app.services.pdf_parser import ParsedCharge, ParsedProfitSheet, KNOWN_CHARGES
+from app.services.pdf_parser import ParsedCharge, ParsedProfitSheet
+
+
+# PROFIT/LOSS SHEET 공통 차지 코드 → (영문명, 한글명)
+KNOWN_CHARGES: dict = {
+    "OF":   ("OCEAN FREIGHT", "해상운임"),
+    "BF":   ("BAF", "유류할증료"),
+    "BAF":  ("BUNKER ADJUSTMENT FACTOR", "유류할증료"),
+    "WAF":  ("WAR RISK SURCHARGE", "전쟁위험할증료"),
+    "THC":  ("TERMINAL HANDLING CHARGE", "터미널처리비"),
+    "CIC":  ("CONTAINER IMBALANCE CHARGE", "컨테이너불균형할증료"),
+    "EBS":  ("EMERGENCY BUNKER SURCHARGE", "긴급유류할증료"),
+    "CRS":  ("CURRENCY RISK SURCHARGE", "환위험할증료"),
+    "EFS":  ("EMERGENCY FUEL SURCHARGE", "긴급연료할증료"),
+    "DOC":  ("DOCUMENTATION FEE", "서류비"),
+    "BL":   ("B/L FEE", "선하증권발행비"),
+    "DO":   ("DELIVERY ORDER FEE", "화물인도지시서비"),
+    "SEAL": ("SEAL FEE", "봉인비"),
+    "AFR":  ("ADVANCE FILING RULES", "사전신고비"),
+    "AMS":  ("AUTOMATED MANIFEST SYSTEM", "자동화물확인"),
+    "ENS":  ("ENTRY SUMMARY DECLARATION", "수입신고"),
+    "ISPS": ("INTERNATIONAL SHIP & PORT FACILITY SECURITY", "보안할증료"),
+    "DUTY": ("CUSTOMS DUTY", "관세"),
+    "VAT":  ("VALUE ADDED TAX", "부가세"),
+    "AF":   ("AIR FREIGHT", "항공운임"),
+    "FSC":  ("FUEL SURCHARGE", "연료할증료"),
+    "SSC":  ("SECURITY SURCHARGE", "보안할증료"),
+    "AWB":  ("AIR WAYBILL FEE", "항공운송장비"),
+    "CC":   ("CUSTOMS CLEARANCE", "통관비"),
+    "DL":   ("DELIVERY", "배달비"),
+    "ST":   ("STORAGE", "창고비"),
+    "HN":   ("HANDLING", "핸들링비"),
+}
 
 
 HEADER_ALIASES = {
@@ -78,16 +110,16 @@ def _extract_meta_from_excel(rows: list, result: ParsedProfitSheet) -> ParsedPro
             next_val = str(row[i + 1]).strip() if i + 1 < len(row) and row[i + 1] else ""
 
             cell_upper = cell_str.upper()
-            if any(k in cell_upper for k in ["CASE", "案件", "안건"]) and next_val:
-                result.case_no = next_val
+            if any(k in cell_upper for k in ["CASE", "案件", "안건", "H.B/L", "HBL"]) and next_val:
+                result.hbl_no = next_val
             elif any(k in cell_upper for k in ["CUSTOMER", "顧客", "거래처", "SHIPPER"]) and next_val:
                 result.customer_name = next_val
             elif any(k in cell_upper for k in ["ASSIGNEE", "담당", "担当"]) and next_val:
                 result.assignee_name = next_val
             elif any(k in cell_upper for k in ["FROM", "ORIGIN", "POL", "출발"]) and next_val:
-                result.origin_port = next_val.upper()
+                result.pol = next_val.upper()
             elif any(k in cell_upper for k in ["TO", "DEST", "POD", "도착"]) and next_val:
-                result.dest_port = next_val.upper()
+                result.pod = next_val.upper()
             elif any(k in cell_upper for k in ["WEIGHT", "G.W", "중량"]) and next_val:
                 try:
                     result.weight_kg = float(str(next_val).replace(",", ""))
@@ -109,7 +141,6 @@ def _find_header_row(rows: list):
         row_strs = [str(c or "").upper().strip() for c in row]
         col_map = {}
 
-        # 매출/매입 컬럼 존재 여부로 헤더 판단
         has_revenue = False
         has_cost = False
 
@@ -137,20 +168,17 @@ def _parse_data_row(row: tuple, col_map: dict) -> Optional[ParsedCharge]:
             return row[idx]
         return None
 
-    # 비용 코드 추출
     code_raw = str(get_cell("charge_code") or "").strip().upper()
     name_raw = str(get_cell("charge_name") or "").strip()
 
     if not code_raw and not name_raw:
         return None
 
-    # 알려진 코드 매핑
     charge_code = code_raw
     charge_name = name_raw
     if code_raw in KNOWN_CHARGES:
         charge_name = charge_name or KNOWN_CHARGES[code_raw][0]
     elif name_raw:
-        # 이름으로 코드 역조회
         for code, (en_name, _) in KNOWN_CHARGES.items():
             if en_name.upper() in name_raw.upper() or code in name_raw.upper():
                 charge_code = code
@@ -160,7 +188,6 @@ def _parse_data_row(row: tuple, col_map: dict) -> Optional[ParsedCharge]:
     if not charge_code:
         return None
 
-    # 매출/매입 금액
     rev_val = _to_float(get_cell("revenue"))
     cost_val = _to_float(get_cell("cost"))
 
@@ -174,8 +201,10 @@ def _parse_data_row(row: tuple, col_map: dict) -> Optional[ParsedCharge]:
         return None
 
     currency = str(get_cell("currency") or "JPY").strip().upper() or "JPY"
-    partner = str(get_cell("partner") or "").strip()
-    unit = str(get_cell("unit") or "").strip()
+    account = str(get_cell("partner") or "").strip()
+
+    # amount_jpy: JPY면 그대로, 외화면 일단 amount로 (API에서 환율 적용)
+    amount_jpy = amount if currency == "JPY" else 0.0
 
     return ParsedCharge(
         charge_code=charge_code,
@@ -183,8 +212,8 @@ def _parse_data_row(row: tuple, col_map: dict) -> Optional[ParsedCharge]:
         is_revenue=is_revenue,
         currency=currency,
         amount=amount,
-        partner_name=partner,
-        unit=unit,
+        amount_jpy=amount_jpy,
+        account_name=account,
         confidence=0.9,
     )
 
@@ -208,6 +237,7 @@ def _fallback_parse(rows: list) -> List[ParsedCharge]:
                                 is_revenue=True,
                                 currency="JPY",
                                 amount=val,
+                                amount_jpy=val,
                                 confidence=0.4,
                             ))
                             break
