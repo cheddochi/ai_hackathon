@@ -197,9 +197,13 @@ def _setup_ocr_env() -> tuple:
     return poppler_path, available_langs
 
 
+MAX_OCR_PAGES = 3   # P&L 데이터는 1~3페이지에 집중
+OCR_DPI       = 150  # 메모리 절약 (200DPI 대비 ~44% 감소)
+
+
 def _pdf_to_images(file_path: str) -> list:
     """
-    PDF → PIL Image 리스트 변환
+    PDF → PIL Image 리스트 변환 (최대 MAX_OCR_PAGES 페이지)
     우선순위: PyMuPDF (외부 바이너리 불필요) → pdf2image (poppler 필요)
     """
     # ── 방법 1: PyMuPDF (fitz) ─────────────────────────────────
@@ -209,17 +213,25 @@ def _pdf_to_images(file_path: str) -> list:
         import io
 
         doc = fitz.open(file_path)
+        total = len(doc)
+        target = min(total, MAX_OCR_PAGES)
         images = []
-        for page in doc:
-            # dpi=200 에 해당하는 matrix
-            mat = fitz.Matrix(200 / 72, 200 / 72)
-            pix = page.get_pixmap(matrix=mat)
+        scale = OCR_DPI / 72
+        mat = fitz.Matrix(scale, scale)
+
+        for page_no in range(target):
+            page = doc[page_no]
+            # colorspace=fitz.csGRAY → 메모리 절약
+            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
             img_bytes = pix.tobytes("png")
-            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            img = Image.open(io.BytesIO(img_bytes)).convert("L")  # 그레이스케일
             images.append(img)
+            pix = None  # 즉시 해제
+
         doc.close()
-        logger.info(f"[OCR] PyMuPDF: {len(images)} 페이지 변환 완료")
+        logger.info(f"[OCR] PyMuPDF: {len(images)}/{total} 페이지 변환 완료 ({OCR_DPI}dpi)")
         return images
+
     except ImportError:
         logger.info("[OCR] PyMuPDF 없음 → pdf2image 시도")
     except Exception as e:
@@ -230,7 +242,12 @@ def _pdf_to_images(file_path: str) -> list:
         from pdf2image import convert_from_path
 
         poppler_path, _ = _setup_ocr_env()
-        pages = convert_from_path(file_path, dpi=200, poppler_path=poppler_path)
+        pages = convert_from_path(
+            file_path, dpi=OCR_DPI,
+            poppler_path=poppler_path,
+            last_page=MAX_OCR_PAGES,
+            grayscale=True,
+        )
         logger.info(f"[OCR] pdf2image: {len(pages)} 페이지 변환 완료")
         return pages
     except Exception as e:

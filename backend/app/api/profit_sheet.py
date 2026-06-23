@@ -233,26 +233,37 @@ async def upload_pdf_bulk(
     """
     복수 PDF 업로드
     반환: 파일별 결과 목록 [{filename, hbl_no, sheet_id, status, warnings}]
+    — 개별 파일 오류는 결과 목록에 포함, 전체 실패 방지
     """
+    import logging as _log
+    _logger = _log.getLogger(__name__)
     results = []
 
     for file in files:
-        item: dict = {"filename": file.filename, "hbl_no": "", "sheet_id": None,
-                      "status": "error", "warnings": []}
+        item: dict = {
+            "filename": file.filename,
+            "hbl_no": "",
+            "sheet_id": None,
+            "status": "error",
+            "warnings": [],
+        }
 
         if not file.filename.lower().endswith(".pdf"):
             item["warnings"].append("PDF 파일이 아닙니다")
             results.append(item)
             continue
 
+        file_path = None
         try:
+            # ── 파일 저장 ──────────────────────────────────────
             file_path = _save_upload(file)
+
+            # ── PDF 파싱 (OCR 포함) ────────────────────────────
             parsed = parse_pdf(file_path)
-
             item["hbl_no"]   = parsed.hbl_no
-            item["warnings"] = parsed.parse_warnings
+            item["warnings"] = list(parsed.parse_warnings)  # 복사본
 
-            # 중복 체크 (같은 case_no)
+            # ── 중복 체크 ──────────────────────────────────────
             case_no = parsed.hbl_no or parsed.ref_no
             if case_no:
                 existing = db.query(ProfitSheetHeader).filter(
@@ -261,10 +272,11 @@ async def upload_pdf_bulk(
                 if existing:
                     item["status"]   = "duplicate"
                     item["sheet_id"] = existing.id
-                    item["warnings"].append(f"이미 등록된 H.B/L NO입니다 (ID: {existing.id})")
+                    item["warnings"].append(f"이미 등록된 H.B/L NO (ID: {existing.id})")
                     results.append(item)
                     continue
 
+            # ── DB 저장 ────────────────────────────────────────
             from app.schemas.transaction import ProfitSheetDetailCreate
             header = _header_from_parsed(parsed, current_user, file_path)
             db.add(header)
@@ -289,8 +301,12 @@ async def upload_pdf_bulk(
             item["status"]   = "success"
 
         except Exception as exc:
-            db.rollback()
-            item["warnings"].append(f"처리 오류: {str(exc)}")
+            _logger.error(f"[bulk] {file.filename} 처리 오류: {exc}", exc_info=True)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            item["warnings"].append(f"처리 오류: {type(exc).__name__}: {str(exc)[:200]}")
             item["status"] = "error"
 
         results.append(item)
