@@ -162,12 +162,16 @@ def _setup_ocr_env() -> tuple:
     # ── 3. TESSDATA_PREFIX 자동 설정 ──────────────────────────────
     tessdata_prefix = os.environ.get("TESSDATA_PREFIX", "")
     if not tessdata_prefix or not os.path.isdir(tessdata_prefix):
-        # 우선순위: 1) /app/tessdata (nixpacks 빌드 시 다운로드 위치)
-        #            2) Nix store 내 eng.traineddata 폴더
-        for candidate in [
-            "/app/tessdata",
+        # 우선순위별 탐색
+        candidates = [
+            "/app/tessdata",                           # nixpacks 빌드 다운로드
             "/tessdata",
-        ]:
+            "/usr/share/tesseract-ocr/4/tessdata",    # Debian/Ubuntu apt
+            "/usr/share/tesseract-ocr/5/tessdata",    # Debian/Ubuntu apt (v5)
+            "/usr/share/tessdata",                     # Ubuntu 공통
+            "/usr/local/share/tessdata",
+        ]
+        for candidate in candidates:
             if os.path.isfile(os.path.join(candidate, "eng.traineddata")):
                 tessdata_prefix = candidate
                 break

@@ -40,26 +40,39 @@ def health_ocr():
     import shutil, os, glob
     result: dict = {}
 
-    # tesseract 바이너리
     result["tesseract_bin"] = shutil.which("tesseract")
-    # pdftoppm (poppler)
     result["pdftoppm_bin"] = shutil.which("pdftoppm")
-    # TESSDATA_PREFIX
-    result["TESSDATA_PREFIX"] = os.environ.get("TESSDATA_PREFIX", "")
-    # /app/tessdata 내용
-    td = "/app/tessdata"
-    result["app_tessdata_exists"] = os.path.isdir(td)
-    if os.path.isdir(td):
-        result["app_tessdata_files"] = os.listdir(td)
-    # Nix store tessdata
-    nix_paths = glob.glob("/nix/store/*/share/tessdata/eng.traineddata")
-    result["nix_tessdata_path"] = os.path.dirname(nix_paths[0]) if nix_paths else None
+    result["TESSDATA_PREFIX_env"] = os.environ.get("TESSDATA_PREFIX", "")
+
+    # 시스템 tessdata 경로 탐색
+    candidates = [
+        "/app/tessdata",
+        "/usr/share/tesseract-ocr/4/tessdata",
+        "/usr/share/tesseract-ocr/5/tessdata",
+        "/usr/share/tessdata",
+        "/usr/local/share/tessdata",
+    ]
+    found_tessdata: dict = {}
+    for c in candidates:
+        if os.path.isdir(c):
+            files = [f for f in os.listdir(c) if f.endswith(".traineddata")]
+            found_tessdata[c] = sorted(files)
+    result["tessdata_found"] = found_tessdata
+
     # PyMuPDF
     try:
         import fitz
-        result["pymupdf_version"] = fitz.version
+        result["pymupdf_version"] = fitz.version[0]
     except ImportError:
         result["pymupdf_version"] = None
+
+    # 실제 OCR 가능 여부 간단 테스트
+    try:
+        import pytesseract
+        langs = pytesseract.get_languages(config="")
+        result["tesseract_langs"] = langs
+    except Exception as e:
+        result["tesseract_langs_error"] = str(e)
 
     return result
 
