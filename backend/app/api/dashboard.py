@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import func, extract
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 from typing import List
 
 from app.core.database import get_db
@@ -17,10 +17,20 @@ def get_dashboard_summary(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    today = date.today()
+    # KST(UTC+9) 기준 오늘 날짜 — Railway 서버는 UTC이므로 명시적으로 KST 계산
+    KST = timezone(timedelta(hours=9))
+    now_kst   = datetime.now(KST)
+    today_kst = now_kst.date()
 
-    # ── 집계 헬퍼 (total_revenue_jpy / gp_jpy 가 NULL인 행은 0으로 처리) ──
-    # 상태 필터 없음 — 등록된 모든 건을 집계
+    # KST 하루 구간을 UTC TIMESTAMPTZ 범위로 변환
+    kst_day_start = datetime(today_kst.year, today_kst.month, today_kst.day,
+                             0, 0, 0, tzinfo=KST)
+    kst_day_end   = kst_day_start + timedelta(days=1)
+    # 월/연 기준도 KST 기준 year/month 사용
+    year_kst  = today_kst.year
+    month_kst = today_kst.month
+
+    # ── 집계 헬퍼 ──────────────────────────────────────────────
     def _sum(q):
         row = q.first()
         return {
@@ -35,23 +45,26 @@ def get_dashboard_summary(
         func.count(ProfitSheetHeader.id).label("count"),
     )
 
-    # 오늘 (등록일 기준 — timezone 무시하고 DATE 비교)
+    # 오늘 (KST 하루 구간을 UTC 범위로 비교 — TIMESTAMPTZ 정확 처리)
     today_data = _sum(
-        base_q.filter(func.date(ProfitSheetHeader.created_at) == today)
-    )
-
-    # 월간
-    monthly_data = _sum(
         base_q.filter(
-            extract("year",  ProfitSheetHeader.created_at) == today.year,
-            extract("month", ProfitSheetHeader.created_at) == today.month,
+            ProfitSheetHeader.created_at >= kst_day_start,
+            ProfitSheetHeader.created_at <  kst_day_end,
         )
     )
 
-    # 연간
+    # 월간 (KST 기준 year/month)
+    monthly_data = _sum(
+        base_q.filter(
+            extract("year",  ProfitSheetHeader.created_at.op("AT TIME ZONE")("Asia/Seoul")) == year_kst,
+            extract("month", ProfitSheetHeader.created_at.op("AT TIME ZONE")("Asia/Seoul")) == month_kst,
+        )
+    )
+
+    # 연간 (KST 기준 year)
     yearly_data = _sum(
         base_q.filter(
-            extract("year", ProfitSheetHeader.created_at) == today.year,
+            extract("year", ProfitSheetHeader.created_at.op("AT TIME ZONE")("Asia/Seoul")) == year_kst,
         )
     )
 
@@ -161,8 +174,9 @@ def get_productivity(
             func.count(ProfitSheetHeader.id).label("case_count"),
         )
         .filter(
-            extract("year",  ProfitSheetHeader.created_at) == year,
-            extract("month", ProfitSheetHeader.created_at) == month,
+            # KST 기준 year/month 필터
+            extract("year",  ProfitSheetHeader.created_at.op("AT TIME ZONE")("Asia/Seoul")) == year,
+            extract("month", ProfitSheetHeader.created_at.op("AT TIME ZONE")("Asia/Seoul")) == month,
             ProfitSheetHeader.assignee_name.isnot(None),
         )
         .group_by(ProfitSheetHeader.assignee_id, ProfitSheetHeader.assignee_name)
