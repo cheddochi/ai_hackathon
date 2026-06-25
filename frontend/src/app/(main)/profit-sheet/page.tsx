@@ -3,7 +3,7 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import Link from "next/link";
 import Header from "@/components/layout/Header";
 import { profitSheetApi } from "@/lib/api";
-import { Plus, Upload, Search, CheckCircle2, XCircle, AlertCircle, X, Loader2 } from "lucide-react";
+import { Plus, Upload, Search, CheckCircle2, XCircle, AlertCircle, X, Loader2, Trash2 } from "lucide-react";
 import clsx from "clsx";
 
 const STATUS_STYLE: Record<string, string> = {
@@ -29,9 +29,15 @@ type BulkResult = {
   warnings: string[];
 };
 
-function fmt(n: number | null) {
+// JPY → KRW 변환 (환율 없으면 기본값 9.5 사용)
+function toKrw(jpy: number | null, krwRate?: number | null): number | null {
+  if (jpy == null) return null;
+  return jpy * (krwRate || 9.5);
+}
+
+function fmtKrw(n: number | null) {
   if (n == null) return "—";
-  return n.toLocaleString("ja-JP", { maximumFractionDigits: 0 });
+  return "₩" + Math.round(n).toLocaleString("ko-KR");
 }
 
 // ── 드래그앤드롭 영역 ────────────────────────────────────────
@@ -121,7 +127,6 @@ function ResultPanel({
       >
         <X size={14} />
       </button>
-      {/* 요약 */}
       <div className="flex gap-4 pb-3 border-b border-gray-100 mb-3">
         <span className="flex items-center gap-1 text-sm text-green-700 font-medium">
           <CheckCircle2 size={14} /> {success}건 성공
@@ -137,7 +142,6 @@ function ResultPanel({
           </span>
         )}
       </div>
-      {/* 파일별 상세 */}
       <ul className="space-y-1 max-h-48 overflow-y-auto text-sm">
         {results.map((r, i) => (
           <li key={i} className="flex items-start gap-2">
@@ -171,6 +175,7 @@ export default function ProfitSheetListPage() {
   const [uploading, setUploading] = useState(false);
   const [bulkResults, setBulkResults] = useState<BulkResult[] | null>(null);
   const [showDropZone, setShowDropZone] = useState(false);
+  const [deletingId, setDeletingId] = useState<number | null>(null);
 
   const load = () =>
     profitSheetApi
@@ -180,16 +185,28 @@ export default function ProfitSheetListPage() {
 
   useEffect(() => { load(); }, [search]);
 
+  const handleDelete = async (id: number, e: React.MouseEvent) => {
+    e.stopPropagation(); // 행 클릭(상세 이동) 방지
+    if (!confirm("이 안건을 삭제하시겠습니까?\n삭제 후 복구가 불가능합니다.")) return;
+    setDeletingId(id);
+    try {
+      await profitSheetApi.delete(id);
+      load();
+    } catch {
+      alert("삭제에 실패했습니다.");
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
   const handleFiles = async (files: File[]) => {
     setUploading(true);
     setBulkResults(null);
     try {
       if (files.length === 1 && !files[0].name.endsWith(".pdf")) {
-        // Excel single
         await profitSheetApi.uploadExcel(files[0]);
         load();
       } else if (files.length === 1) {
-        // Single PDF → 기존 단건 API
         const res = await profitSheetApi.uploadPdf(files[0]);
         setBulkResults([
           {
@@ -202,7 +219,6 @@ export default function ProfitSheetListPage() {
         ]);
         load();
       } else {
-        // Bulk PDF
         const res = await profitSheetApi.uploadPdfBulk(files);
         setBulkResults(res.data.results);
         load();
@@ -265,7 +281,7 @@ export default function ProfitSheetListPage() {
           <table className="w-full text-sm">
             <thead className="bg-gray-50 border-b border-gray-100">
               <tr>
-                {["안건번호", "업무코드", "거래처", "담당자", "출발→도착", "매출(¥)", "GP(¥)", "GP율", "상태", "등록일"].map((h) => (
+                {["안건번호", "업무코드", "거래처", "담당자", "출발→도착", "매출(₩)", "GP(₩)", "GP율", "상태", "등록일", ""].map((h) => (
                   <th key={h} className="text-left px-4 py-3 text-xs font-semibold text-gray-500">
                     {h}
                   </th>
@@ -286,8 +302,12 @@ export default function ProfitSheetListPage() {
                   <td className="px-4 py-3 text-xs text-gray-500">
                     {s.origin_port || "—"} → {s.dest_port || "—"}
                   </td>
-                  <td className="px-4 py-3 text-right font-semibold">{fmt(s.total_revenue_jpy)}</td>
-                  <td className="px-4 py-3 text-right font-semibold text-success">{fmt(s.gp_jpy)}</td>
+                  <td className="px-4 py-3 text-right font-semibold">
+                    {fmtKrw(toKrw(s.total_revenue_jpy, s.exchange_rate_krw))}
+                  </td>
+                  <td className="px-4 py-3 text-right font-semibold text-success">
+                    {fmtKrw(toKrw(s.gp_jpy, s.exchange_rate_krw))}
+                  </td>
                   <td className="px-4 py-3 text-right">
                     {s.gp_rate != null ? `${s.gp_rate.toFixed(1)}%` : "—"}
                   </td>
@@ -299,11 +319,25 @@ export default function ProfitSheetListPage() {
                   <td className="px-4 py-3 text-xs text-gray-400">
                     {new Date(s.created_at).toLocaleDateString("ko-KR")}
                   </td>
+                  <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
+                    <button
+                      onClick={(e) => handleDelete(s.id, e)}
+                      disabled={deletingId === s.id}
+                      className="p-1.5 text-gray-300 hover:text-red-500 hover:bg-red-50 rounded transition-colors disabled:opacity-40"
+                      title="삭제"
+                    >
+                      {deletingId === s.id ? (
+                        <Loader2 size={14} className="animate-spin" />
+                      ) : (
+                        <Trash2 size={14} />
+                      )}
+                    </button>
+                  </td>
                 </tr>
               ))}
               {sheets.length === 0 && (
                 <tr>
-                  <td colSpan={10} className="px-4 py-12 text-center text-sm text-gray-400">
+                  <td colSpan={11} className="px-4 py-12 text-center text-sm text-gray-400">
                     등록된 안건이 없습니다
                   </td>
                 </tr>

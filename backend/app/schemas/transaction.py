@@ -95,6 +95,8 @@ class ProfitSheetListItem(BaseModel):
     total_revenue_jpy: Optional[float]
     gp_jpy: Optional[float]
     gp_rate: Optional[float]
+    exchange_rate_usd: Optional[float]
+    exchange_rate_krw: Optional[float]
     status: str
     created_at: datetime
 

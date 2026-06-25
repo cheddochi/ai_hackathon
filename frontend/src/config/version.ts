@@ -7,5 +7,5 @@
  *   v1.[X].0 — 기능 추가
  *   v1.0.[X] — 버그 픽스
  */
-export const APP_VERSION = "v1.1.0";
+export const APP_VERSION = "v1.2.0";
 export const APP_NAME = "LOTOS AI";
