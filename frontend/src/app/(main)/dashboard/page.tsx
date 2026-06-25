@@ -71,32 +71,32 @@ export default function DashboardPage() {
         <div className="grid grid-cols-4 gap-4">
           {[
             {
-              label: "오늘 매출",
-              value: summary ? fmtKrw(summary.today.revenue_jpy) : "—",
-              sub: `${summary?.today.count ?? 0}건 (KST ${summary?.today.date_kst ?? ""})`,
+              label: "이번달 매출",
+              value: summary ? fmtKrw(summary.monthly.revenue_jpy) : "—",
+              sub: `${summary?.monthly.count ?? 0}건`,
               icon: TrendingUp,
               color: "text-accent",
             },
             {
-              label: "오늘 GP",
-              value: summary ? fmtKrw(summary.today.gp_jpy) : "—",
-              sub: summary?.today.count > 0
-                ? `GP율 ${summary.today.revenue_jpy > 0 ? (summary.today.gp_jpy / summary.today.revenue_jpy * 100).toFixed(1) : 0}%`
-                : "",
-              icon: Package,
-              color: "text-success",
-            },
-            {
-              label: "월간 GP",
+              label: "이번달 GP",
               value: summary ? fmtKrw(summary.monthly.gp_jpy) : "—",
               sub: summary ? `GP율 ${summary.monthly.gp_rate.toFixed(1)}%` : "",
-              icon: Award,
-              color: "text-accent",
+              icon: Package,
+              color: "text-success",
             },
             {
               label: "연간 매출",
               value: summary ? fmtKrw(summary.yearly.revenue_jpy) : "—",
               sub: `${summary?.yearly.count ?? 0}건`,
+              icon: Award,
+              color: "text-accent",
+            },
+            {
+              label: "연간 GP",
+              value: summary ? fmtKrw(summary.yearly.gp_jpy) : "—",
+              sub: summary?.yearly.count > 0
+                ? `GP율 ${summary.yearly.revenue_jpy > 0 ? (summary.yearly.gp_jpy / summary.yearly.revenue_jpy * 100).toFixed(1) : 0}%`
+                : "",
               icon: Users,
               color: "text-gray-600",
             },
