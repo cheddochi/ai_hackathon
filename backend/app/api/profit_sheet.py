@@ -1,9 +1,12 @@
 import json
+import logging
 import os
 import shutil
 import uuid
+from datetime import datetime, timezone
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -407,3 +410,68 @@ def delete_profit_sheet(
     db.delete(sheet)
     db.commit()
     return {"ok": True}
+
+
+# ── 인간 결재 ─────────────────────────────────────────────────
+
+class DecisionRequest(BaseModel):
+    decision: Optional[str] = None          # "APPROVED" | "REJECTED" | null(해제)
+    comment: Optional[str] = None           # 결재 의견
+    exchange_rate_krw: Optional[float] = None   # JPY→KRW 환율
+    exchange_rate_usd: Optional[float] = None   # USD→JPY 환율
+    exchange_rate_note: Optional[str] = None    # 환율 출처/기준일시 메모
+
+
+@router.patch("/{sheet_id}/decision", response_model=ProfitSheetOut)
+def update_decision(
+    sheet_id: int,
+    body: DecisionRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    인간 결재 — 승인 / 반려 / 해제 (decision=null)
+    환율도 함께 저장하여 계약 시점 기준환율을 보존합니다.
+    """
+    sheet = db.query(ProfitSheetHeader).filter(ProfitSheetHeader.id == sheet_id).first()
+    if not sheet:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    # 결재값 검증
+    if body.decision is not None and body.decision not in ("APPROVED", "REJECTED"):
+        raise HTTPException(status_code=400, detail="decision은 APPROVED / REJECTED / null 만 허용됩니다")
+
+    # 인간 결재 저장
+    sheet.human_decision = body.decision
+    sheet.human_comment  = body.comment
+    if body.decision is not None:
+        sheet.human_decided_by = current_user.name
+        sheet.human_decided_at = datetime.now(timezone.utc)
+    else:
+        # 해제 시 결재자/일시도 초기화
+        sheet.human_decided_by = None
+        sheet.human_decided_at = None
+
+    # 환율 저장 (값이 있을 때만 덮어쓰기)
+    if body.exchange_rate_krw is not None:
+        sheet.exchange_rate_krw = body.exchange_rate_krw
+    if body.exchange_rate_usd is not None:
+        sheet.exchange_rate_usd = body.exchange_rate_usd
+    if body.exchange_rate_note is not None:
+        sheet.exchange_rate_note = body.exchange_rate_note
+
+    # 환율이 변경된 경우 KRW 환산 금액 재계산
+    if body.exchange_rate_krw is not None or body.exchange_rate_usd is not None:
+        _recalc_krw(sheet, db)
+
+    db.commit()
+    db.refresh(sheet)
+    return sheet
+
+
+def _recalc_krw(sheet: ProfitSheetHeader, db: Session) -> None:
+    """환율 변경 시 detail의 amount_jpy 기반으로 합계를 재계산 (JPY 기준 변경 없음, 환율 메타만 저장)."""
+    # 현재 설계에서 amount_jpy는 JPY 기준으로 고정되어 있으므로
+    # KRW 환산은 프론트엔드에서 exchange_rate_krw 를 곱해서 표시합니다.
+    # 여기서는 exchange_rate_krw 값 저장만 처리합니다 (향후 amount_krw 컬럼 추가 시 확장).
+    pass

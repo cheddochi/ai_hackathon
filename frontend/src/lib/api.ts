@@ -64,6 +64,13 @@ export const profitSheetApi = {
     });
   },
   delete: (id: number) => api.delete(`/profit-sheets/${id}`),
+  updateDecision: (id: number, data: {
+    decision: "APPROVED" | "REJECTED" | null;
+    comment?: string;
+    exchange_rate_krw?: number;
+    exchange_rate_usd?: number;
+    exchange_rate_note?: string;
+  }) => api.patch(`/profit-sheets/${id}/decision`, data),
 };
 
 // ── Approval ───────────────────────────────────────────────
@@ -99,4 +106,5 @@ export const masterApi = {
   exchangeRates: () => api.get("/master/exchange-rates"),
   createExchangeRate: (data: unknown) => api.post("/master/exchange-rates", data),
   jobCodes: () => api.get("/master/job-codes"),
+  todayExchangeRate: () => api.get("/master/exchange-rate/today"),
 };

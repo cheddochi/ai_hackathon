@@ -53,6 +53,13 @@ class ProfitSheetHeader(Base):
     input_method = Column(Enum(InputMethod), default=InputMethod.MANUAL)
     original_file_path = Column(String(500))
     notes = Column(Text)
+    # ── 인간 결재 ──────────────────────────────────────────────
+    human_decision = Column(String(20), nullable=True)       # APPROVED / REJECTED / null
+    human_comment  = Column(Text, nullable=True)             # 결재 의견
+    human_decided_by = Column(String(100), nullable=True)    # 결재자 이름
+    human_decided_at = Column(DateTime(timezone=True), nullable=True)  # 결재 일시
+    # ── 계약 시점 환율 ─────────────────────────────────────────
+    exchange_rate_note = Column(String(200), nullable=True)  # 환율 출처/기준일시 메모
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

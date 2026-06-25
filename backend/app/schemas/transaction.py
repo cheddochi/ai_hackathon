@@ -68,6 +68,7 @@ class ProfitSheetOut(BaseModel):
     base_currency: str
     exchange_rate_usd: Optional[float]
     exchange_rate_krw: Optional[float]
+    exchange_rate_note: Optional[str]
     total_revenue_jpy: Optional[float]
     total_cost_jpy: Optional[float]
     gp_jpy: Optional[float]
@@ -76,6 +77,11 @@ class ProfitSheetOut(BaseModel):
     status: str
     input_method: str
     notes: Optional[str]
+    # 인간 결재
+    human_decision: Optional[str]
+    human_comment: Optional[str]
+    human_decided_by: Optional[str]
+    human_decided_at: Optional[datetime]
     created_at: datetime
     details: List[ProfitSheetDetailOut] = []
 
@@ -98,6 +104,11 @@ class ProfitSheetListItem(BaseModel):
     exchange_rate_usd: Optional[float]
     exchange_rate_krw: Optional[float]
     status: str
+    # 인간 결재
+    human_decision: Optional[str]
+    human_comment: Optional[str]
+    human_decided_by: Optional[str]
+    human_decided_at: Optional[datetime]
     created_at: datetime
 
     class Config:

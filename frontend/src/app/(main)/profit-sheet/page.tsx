@@ -3,7 +3,10 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import Link from "next/link";
 import Header from "@/components/layout/Header";
 import { profitSheetApi } from "@/lib/api";
-import { Plus, Upload, Search, CheckCircle2, XCircle, AlertCircle, X, Loader2, Trash2 } from "lucide-react";
+import {
+  Plus, Upload, Search, CheckCircle2, XCircle, AlertCircle,
+  X, Loader2, Trash2, ThumbsUp, ThumbsDown,
+} from "lucide-react";
 import clsx from "clsx";
 
 const STATUS_STYLE: Record<string, string> = {
@@ -29,15 +32,115 @@ type BulkResult = {
   warnings: string[];
 };
 
-// JPY → KRW 변환 (환율 없으면 기본값 9.5 사용)
+type CommentPopup = {
+  decision: "APPROVED" | "REJECTED";
+  comment: string;
+  decided_by: string;
+  decided_at: string;
+};
+
+// JPY → KRW 변환
 function toKrw(jpy: number | null, krwRate?: number | null): number | null {
   if (jpy == null) return null;
   return jpy * (krwRate || 9.5);
 }
-
 function fmtKrw(n: number | null) {
   if (n == null) return "—";
   return "₩" + Math.round(n).toLocaleString("ko-KR");
+}
+
+// ── 결재 배지 ────────────────────────────────────────────────
+function DecisionBadge({
+  sheet,
+  onClick,
+}: {
+  sheet: any;
+  onClick: (e: React.MouseEvent) => void;
+}) {
+  if (!sheet.human_decision) {
+    return <span className="text-xs text-gray-300">—</span>;
+  }
+  const isApproved = sheet.human_decision === "APPROVED";
+  return (
+    <button
+      onClick={onClick}
+      className={clsx(
+        "inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold transition-opacity hover:opacity-80",
+        isApproved
+          ? "bg-green-100 text-green-700"
+          : "bg-red-100 text-red-600"
+      )}
+      title="클릭하여 결재 의견 확인"
+    >
+      {isApproved ? <ThumbsUp size={11} /> : <ThumbsDown size={11} />}
+      {isApproved ? "승인" : "반려"}
+    </button>
+  );
+}
+
+// ── 의견 팝업 모달 ───────────────────────────────────────────
+function CommentModal({
+  popup,
+  onClose,
+}: {
+  popup: CommentPopup;
+  onClose: () => void;
+}) {
+  const isApproved = popup.decision === "APPROVED";
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/30"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white rounded-xl shadow-xl w-full max-w-md p-6 relative"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button
+          onClick={onClose}
+          className="absolute top-4 right-4 text-gray-400 hover:text-gray-600"
+        >
+          <X size={16} />
+        </button>
+
+        {/* 헤더 */}
+        <div className={clsx(
+          "flex items-center gap-2 mb-4 pb-4 border-b",
+          isApproved ? "border-green-100" : "border-red-100"
+        )}>
+          <div className={clsx(
+            "w-8 h-8 rounded-full flex items-center justify-center",
+            isApproved ? "bg-green-100" : "bg-red-100"
+          )}>
+            {isApproved
+              ? <ThumbsUp size={16} className="text-green-600" />
+              : <ThumbsDown size={16} className="text-red-500" />
+            }
+          </div>
+          <div>
+            <p className={clsx("font-semibold text-sm", isApproved ? "text-green-700" : "text-red-600")}>
+              {isApproved ? "승인" : "반려"}
+            </p>
+            <p className="text-xs text-gray-400">
+              {popup.decided_by} · {popup.decided_at ? new Date(popup.decided_at).toLocaleString("ko-KR") : "—"}
+            </p>
+          </div>
+        </div>
+
+        {/* 의견 */}
+        <div className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed min-h-[60px]">
+          {popup.comment || <span className="text-gray-400 italic">의견 없음</span>}
+        </div>
+
+        <button
+          onClick={onClose}
+          className="mt-5 w-full btn-secondary text-sm"
+        >
+          닫기
+        </button>
+      </div>
+    </div>
+  );
 }
 
 // ── 드래그앤드롭 영역 ────────────────────────────────────────
@@ -71,9 +174,7 @@ function DropZone({
       onClick={() => !uploading && inputRef.current?.click()}
       className={clsx(
         "border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all select-none",
-        dragging
-          ? "border-accent bg-accent/5 scale-[1.01]"
-          : "border-gray-200 hover:border-accent/60 hover:bg-gray-50",
+        dragging ? "border-accent bg-accent/5 scale-[1.01]" : "border-gray-200 hover:border-accent/60 hover:bg-gray-50",
         uploading && "pointer-events-none opacity-60"
       )}
     >
@@ -97,9 +198,7 @@ function DropZone({
       ) : (
         <div className="flex flex-col items-center gap-2 text-gray-400">
           <Upload size={32} className={clsx(dragging ? "text-accent" : "text-gray-300")} />
-          <p className="text-sm font-medium text-gray-600">
-            PDF 파일을 드래그하거나 클릭해서 선택
-          </p>
+          <p className="text-sm font-medium text-gray-600">PDF 파일을 드래그하거나 클릭해서 선택</p>
           <p className="text-xs">복수 파일 동시 업로드 가능 · OCR 지원</p>
         </div>
       )}
@@ -108,23 +207,14 @@ function DropZone({
 }
 
 // ── 업로드 결과 패널 ─────────────────────────────────────────
-function ResultPanel({
-  results,
-  onClose,
-}: {
-  results: BulkResult[];
-  onClose: () => void;
-}) {
+function ResultPanel({ results, onClose }: { results: BulkResult[]; onClose: () => void }) {
   const success = results.filter((r) => r.status === "success").length;
   const duplicate = results.filter((r) => r.status === "duplicate").length;
   const error = results.filter((r) => r.status === "error").length;
 
   return (
     <div className="card border border-gray-200 relative">
-      <button
-        onClick={onClose}
-        className="absolute top-3 right-3 text-gray-400 hover:text-gray-600"
-      >
+      <button onClick={onClose} className="absolute top-3 right-3 text-gray-400 hover:text-gray-600">
         <X size={14} />
       </button>
       <div className="flex gap-4 pb-3 border-b border-gray-100 mb-3">
@@ -150,14 +240,10 @@ function ResultPanel({
             {r.status === "error" && <XCircle size={14} className="text-red-500 mt-0.5 shrink-0" />}
             <div className="min-w-0">
               <span className="font-medium text-gray-700 truncate">{r.filename}</span>
-              {r.hbl_no && (
-                <span className="ml-2 text-xs text-gray-400">H.B/L: {r.hbl_no}</span>
-              )}
+              {r.hbl_no && <span className="ml-2 text-xs text-gray-400">H.B/L: {r.hbl_no}</span>}
               {r.warnings.length > 0 && (
                 <ul className="mt-0.5 space-y-0.5">
-                  {r.warnings.map((w, j) => (
-                    <li key={j} className="text-xs text-gray-500">⚠ {w}</li>
-                  ))}
+                  {r.warnings.map((w, j) => <li key={j} className="text-xs text-gray-500">⚠ {w}</li>)}
                 </ul>
               )}
             </div>
@@ -176,6 +262,7 @@ export default function ProfitSheetListPage() {
   const [bulkResults, setBulkResults] = useState<BulkResult[] | null>(null);
   const [showDropZone, setShowDropZone] = useState(false);
   const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [commentPopup, setCommentPopup] = useState<CommentPopup | null>(null);
 
   const load = () =>
     profitSheetApi
@@ -186,7 +273,7 @@ export default function ProfitSheetListPage() {
   useEffect(() => { load(); }, [search]);
 
   const handleDelete = async (id: number, e: React.MouseEvent) => {
-    e.stopPropagation(); // 행 클릭(상세 이동) 방지
+    e.stopPropagation();
     if (!confirm("이 안건을 삭제하시겠습니까?\n삭제 후 복구가 불가능합니다.")) return;
     setDeletingId(id);
     try {
@@ -199,6 +286,17 @@ export default function ProfitSheetListPage() {
     }
   };
 
+  const handleDecisionClick = (sheet: any, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!sheet.human_decision) return;
+    setCommentPopup({
+      decision: sheet.human_decision,
+      comment: sheet.human_comment || "",
+      decided_by: sheet.human_decided_by || "—",
+      decided_at: sheet.human_decided_at || "",
+    });
+  };
+
   const handleFiles = async (files: File[]) => {
     setUploading(true);
     setBulkResults(null);
@@ -208,15 +306,7 @@ export default function ProfitSheetListPage() {
         load();
       } else if (files.length === 1) {
         const res = await profitSheetApi.uploadPdf(files[0]);
-        setBulkResults([
-          {
-            filename: files[0].name,
-            hbl_no: res.data.case_no || "",
-            sheet_id: res.data.id,
-            status: "success",
-            warnings: [],
-          },
-        ]);
+        setBulkResults([{ filename: files[0].name, hbl_no: res.data.case_no || "", sheet_id: res.data.id, status: "success", warnings: [] }]);
         load();
       } else {
         const res = await profitSheetApi.uploadPdfBulk(files);
@@ -225,9 +315,7 @@ export default function ProfitSheetListPage() {
       }
     } catch (err: any) {
       const msg = err?.response?.data?.detail || "업로드 실패";
-      setBulkResults([
-        { filename: files.map((f) => f.name).join(", "), hbl_no: "", sheet_id: null, status: "error", warnings: [msg] },
-      ]);
+      setBulkResults([{ filename: files.map((f) => f.name).join(", "), hbl_no: "", sheet_id: null, status: "error", warnings: [msg] }]);
     } finally {
       setUploading(false);
     }
@@ -236,6 +324,10 @@ export default function ProfitSheetListPage() {
   return (
     <div>
       <Header title="Profit Sheet" />
+      {commentPopup && (
+        <CommentModal popup={commentPopup} onClose={() => setCommentPopup(null)} />
+      )}
+
       <div className="p-6 space-y-4">
         {/* 액션 바 */}
         <div className="flex items-center justify-between gap-4">
@@ -251,28 +343,20 @@ export default function ProfitSheetListPage() {
           <div className="flex gap-2">
             <button
               onClick={() => { setShowDropZone((v) => !v); setBulkResults(null); }}
-              className={clsx(
-                "btn-secondary flex items-center gap-2 text-sm",
-                showDropZone && "bg-accent/10 border-accent/40"
-              )}
+              className={clsx("btn-secondary flex items-center gap-2 text-sm", showDropZone && "bg-accent/10 border-accent/40")}
             >
-              <Upload size={14} />
-              파일 업로드
+              <Upload size={14} /> 파일 업로드
             </button>
             <Link href="/profit-sheet/new" className="btn-primary flex items-center gap-2 text-sm">
-              <Plus size={14} />
-              새 안건 등록
+              <Plus size={14} /> 새 안건 등록
             </Link>
           </div>
         </div>
 
-        {/* 드래그앤드롭 영역 */}
         {showDropZone && (
           <div className="space-y-3">
             <DropZone onFiles={handleFiles} uploading={uploading} />
-            {bulkResults && (
-              <ResultPanel results={bulkResults} onClose={() => setBulkResults(null)} />
-            )}
+            {bulkResults && <ResultPanel results={bulkResults} onClose={() => setBulkResults(null)} />}
           </div>
         )}
 
@@ -281,10 +365,8 @@ export default function ProfitSheetListPage() {
           <table className="w-full text-sm">
             <thead className="bg-gray-50 border-b border-gray-100">
               <tr>
-                {["안건번호", "업무코드", "거래처", "담당자", "출발→도착", "매출(₩)", "GP(₩)", "GP율", "상태", "등록일", ""].map((h) => (
-                  <th key={h} className="text-left px-4 py-3 text-xs font-semibold text-gray-500">
-                    {h}
-                  </th>
+                {["안건번호", "업무코드", "거래처", "담당자", "출발→도착", "매출(₩)", "GP(₩)", "GP율", "AI판정", "인간결재", "등록일", ""].map((h) => (
+                  <th key={h} className="text-left px-4 py-3 text-xs font-semibold text-gray-500">{h}</th>
                 ))}
               </tr>
             </thead>
@@ -316,6 +398,12 @@ export default function ProfitSheetListPage() {
                       {STATUS_LABEL[s.status] || s.status}
                     </span>
                   </td>
+                  <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
+                    <DecisionBadge
+                      sheet={s}
+                      onClick={(e) => handleDecisionClick(s, e)}
+                    />
+                  </td>
                   <td className="px-4 py-3 text-xs text-gray-400">
                     {new Date(s.created_at).toLocaleDateString("ko-KR")}
                   </td>
@@ -326,18 +414,14 @@ export default function ProfitSheetListPage() {
                       className="p-1.5 text-gray-300 hover:text-red-500 hover:bg-red-50 rounded transition-colors disabled:opacity-40"
                       title="삭제"
                     >
-                      {deletingId === s.id ? (
-                        <Loader2 size={14} className="animate-spin" />
-                      ) : (
-                        <Trash2 size={14} />
-                      )}
+                      {deletingId === s.id ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
                     </button>
                   </td>
                 </tr>
               ))}
               {sheets.length === 0 && (
                 <tr>
-                  <td colSpan={11} className="px-4 py-12 text-center text-sm text-gray-400">
+                  <td colSpan={12} className="px-4 py-12 text-center text-sm text-gray-400">
                     등록된 안건이 없습니다
                   </td>
                 </tr>
