@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
-from sqlalchemy import func, extract
+from sqlalchemy import func, extract, cast, text
+from sqlalchemy.types import Date
 from datetime import datetime, date, timedelta, timezone
 from typing import List
 
@@ -11,22 +12,24 @@ from app.models.transaction import ProfitSheetHeader, ApprovalStatus
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
+# PostgreSQL 서버 측에서 KST 날짜 추출 (Python 타임존 의존 제거)
+def _kst_date(col):
+    """TIMESTAMPTZ 컬럼을 KST 기준 DATE로 변환 (순수 PostgreSQL 표현식)"""
+    return cast(func.timezone("Asia/Seoul", col), Date)
+
 
 @router.get("/summary")
 def get_dashboard_summary(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # KST(UTC+9) 기준 오늘 날짜 — Railway 서버는 UTC이므로 명시적으로 KST 계산
+    # KST 오늘 날짜를 PostgreSQL 서버 측에서 계산 (Python 타임존 의존 없음)
+    today_kst_expr = cast(func.timezone("Asia/Seoul", func.now()), Date)
+
+    # Python 측 KST 월/연 (month/year boundary는 Python 타임존 오차 무시 수준)
     KST = timezone(timedelta(hours=9))
     now_kst   = datetime.now(KST)
     today_kst = now_kst.date()
-
-    # KST 하루 구간을 UTC TIMESTAMPTZ 범위로 변환
-    kst_day_start = datetime(today_kst.year, today_kst.month, today_kst.day,
-                             0, 0, 0, tzinfo=KST)
-    kst_day_end   = kst_day_start + timedelta(days=1)
-    # 월/연 기준도 KST 기준 year/month 사용
     year_kst  = today_kst.year
     month_kst = today_kst.month
 
@@ -45,11 +48,10 @@ def get_dashboard_summary(
         func.count(ProfitSheetHeader.id).label("count"),
     )
 
-    # 오늘 (KST 하루 구간을 UTC 범위로 비교 — TIMESTAMPTZ 정확 처리)
+    # 오늘 — PostgreSQL 서버 측 KST 날짜 비교 (Python datetime 의존 없음)
     today_data = _sum(
         base_q.filter(
-            ProfitSheetHeader.created_at >= kst_day_start,
-            ProfitSheetHeader.created_at <  kst_day_end,
+            _kst_date(ProfitSheetHeader.created_at) == today_kst_expr,
         )
     )
 
@@ -88,6 +90,13 @@ def get_dashboard_summary(
         .scalar() or 0
     )
 
+    # PostgreSQL 서버의 실제 KST 날짜 (디버깅용)
+    server_kst_date_row = db.execute(
+        text("SELECT CAST(timezone('Asia/Seoul', NOW()) AS DATE) AS d, timezone('Asia/Seoul', NOW()) AS ts")
+    ).first()
+    server_kst_date = str(server_kst_date_row.d) if server_kst_date_row else "unknown"
+    server_kst_ts   = str(server_kst_date_row.ts) if server_kst_date_row else "unknown"
+
     monthly_rev = monthly_data["revenue"]
     monthly_gp  = monthly_data["gp"]
 
@@ -96,6 +105,7 @@ def get_dashboard_summary(
             "revenue_jpy": today_data["revenue"],
             "gp_jpy":      today_data["gp"],
             "count":       today_data["count"],
+            "date_kst":    server_kst_date,   # 서버가 인식하는 KST 오늘 날짜 (디버깅)
         },
         "monthly": {
             "revenue_jpy": monthly_rev,

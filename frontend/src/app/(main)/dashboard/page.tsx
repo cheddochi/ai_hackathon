@@ -73,7 +73,7 @@ export default function DashboardPage() {
             {
               label: "오늘 매출",
               value: summary ? fmtKrw(summary.today.revenue_jpy) : "—",
-              sub: `${summary?.today.count ?? 0}건`,
+              sub: `${summary?.today.count ?? 0}건 (KST ${summary?.today.date_kst ?? ""})`,
               icon: TrendingUp,
               color: "text-accent",
             },
