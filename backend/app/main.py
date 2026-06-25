@@ -1,10 +1,34 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 from app.core.database import Base, engine
 from app.api import auth, profit_sheet, approval, dashboard, todo, master
 
 # 테이블 생성 (Alembic 없이 개발 모드에서 사용)
 Base.metadata.create_all(bind=engine)
+
+
+def _migrate_add_columns() -> None:
+    """
+    기존 테이블에 새 컬럼을 안전하게 추가합니다.
+    PostgreSQL의 'ADD COLUMN IF NOT EXISTS'를 사용하므로 중복 실행 무해합니다.
+    Alembic 없이 스키마 변경이 필요할 때 여기에 추가합니다.
+    """
+    statements = [
+        # v1.3.0 — 인간 결재 + 환율 메모
+        "ALTER TABLE profit_sheet_header ADD COLUMN IF NOT EXISTS human_decision    VARCHAR(20)",
+        "ALTER TABLE profit_sheet_header ADD COLUMN IF NOT EXISTS human_comment     TEXT",
+        "ALTER TABLE profit_sheet_header ADD COLUMN IF NOT EXISTS human_decided_by  VARCHAR(100)",
+        "ALTER TABLE profit_sheet_header ADD COLUMN IF NOT EXISTS human_decided_at  TIMESTAMPTZ",
+        "ALTER TABLE profit_sheet_header ADD COLUMN IF NOT EXISTS exchange_rate_note VARCHAR(200)",
+    ]
+    with engine.connect() as conn:
+        for stmt in statements:
+            conn.execute(text(stmt))
+        conn.commit()
+
+
+_migrate_add_columns()
 
 app = FastAPI(
     title="LOTOS AI Profit Approval System",
