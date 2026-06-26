@@ -82,6 +82,8 @@ class ProfitSheetOut(BaseModel):
     human_comment: Optional[str]
     human_decided_by: Optional[str]
     human_decided_at: Optional[datetime]
+    # AI 거래 분석
+    ai_analysis: Optional[str]
     created_at: datetime
     details: List[ProfitSheetDetailOut] = []
 

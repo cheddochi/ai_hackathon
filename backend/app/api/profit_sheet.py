@@ -19,6 +19,7 @@ from app.schemas.transaction import ProfitSheetCreate, ProfitSheetOut, ProfitShe
 from app.services.pdf_parser import parse_pdf, ParsedProfitSheet
 from app.services.excel_parser import parse_excel
 from app.services.approval_engine import calculate_rt
+from app.services.ai_analyzer import analyze_transaction
 
 router = APIRouter(prefix="/profit-sheets", tags=["profit-sheet"])
 
@@ -207,6 +208,11 @@ async def upload_pdf(
 
     from app.schemas.transaction import ProfitSheetDetailCreate
     header = _header_from_parsed(parsed, current_user, file_path)
+
+    # AI 거래 분석 (ANTHROPIC_API_KEY 있을 때만 동작, 실패해도 업로드 계속)
+    if parsed.raw_text:
+        header.ai_analysis = analyze_transaction(parsed.raw_text, parsed.hbl_no)
+
     db.add(header)
     db.flush()
 
@@ -282,6 +288,11 @@ async def upload_pdf_bulk(
             # ── DB 저장 ────────────────────────────────────────
             from app.schemas.transaction import ProfitSheetDetailCreate
             header = _header_from_parsed(parsed, current_user, file_path)
+
+            # AI 거래 분석
+            if parsed.raw_text:
+                header.ai_analysis = analyze_transaction(parsed.raw_text, parsed.hbl_no)
+
             db.add(header)
             db.flush()
 

@@ -341,6 +341,28 @@ def _extract_header(text: str) -> dict:
         partner = _find(r'支払先\s*:\s*(.+?)(?:\s{3,}|\n|$)')
     result['partner'] = partner
 
+    # SHIPPER (Commercial Invoice 기반)
+    result['shipper'] = _find(r'SHIPPER\s*:\s*([A-Z][A-Z0-9\s\.\,]+?)(?:\n|$)')
+
+    # CONSIGNEE / 수입자 — "For Account of Risk of Messrs." 다음 줄 또는 직접 패턴
+    cns = _find(r'For\s+Account\s+of\s+Risk\s+of\s+Messrs\.\s*\n(.+?)(?:\n|$)')
+    if not cns:
+        cns = _find(r'CONSIGNEE\s*:\s*([A-Z][A-Z0-9\s\.\,]+?)(?:\n|$)')
+    result['consignee'] = cns
+
+    # 품목 (Description of Goods — Packing List / Commercial Invoice)
+    goods = _find(r'(?:POLYAMIDE|NYLON|CHIP|CARGO|GOODS|COMMODITY)\s*[:\-]?\s*(.{5,80})(?:\n|$)')
+    if not goods:
+        goods = _find(r'(?:1\))\s*([A-Z][A-Z0-9\s\(\)]+?)(?:\n|$)')
+    result['goods'] = goods
+
+    # 보험 가입액 (Sum Insured)
+    m_ins = re.search(r'[¥￥]\s*([\d,]+)\s*[\.\-]', text)
+    if m_ins:
+        result['sum_insured'] = _parse_float(m_ins.group(1))
+    else:
+        result['sum_insured'] = None
+
     return result
 
 
@@ -407,29 +429,47 @@ def _extract_ex_rate(text: str) -> float:
 def _parse_charge_line(line: str) -> Optional[ParsedCharge]:
     """
     단일 비용 항목 줄 파싱
-    형식: CODE  DESCRIPTION  CURRENCY  EXRATE  amounts...
+    형식 A (코드 분리):  CODE  DESCRIPTION  CURRENCY  EXRATE  amounts...
+    형식 B (코드 없음):  DESCRIPTION(긴 이름)  CURRENCY  EXRATE  amounts...
     예시:
       BF BAF USD 160.5600 310.00 49,774 310.00 49,774
       TH THC JPY 160.5600 52,000 52,000
       CC CUSTOMS CLEARANCE FEE JPY 160.5600 11,800 11,800
+      INSURANCE FEE(B/L) JPY 160.8400 48,000 48,000   ← 보험 서류
     """
     line = line.strip()
     if not line:
         return None
 
-    # CODE: 2~5 대문자
+    # 패턴 A: 2~5글자 CODE + 설명 + 통화 + 환율 + 금액
     m = re.match(
         r'^([A-Z]{2,5})\s+(.+?)\s+(JPY|USD|KRW)\s+([\d,\.]+)\s+([\d\.,\s\|\-]+)$',
         line,
     )
-    if not m:
-        return None
-
-    code      = m.group(1).upper()
-    name      = m.group(2).strip()
-    currency  = m.group(3).upper()
-    ex_rate   = _parse_float(m.group(4))
-    nums_str  = m.group(5)
+    if m:
+        code     = m.group(1).upper()
+        name     = m.group(2).strip()
+        currency = m.group(3).upper()
+        ex_rate  = _parse_float(m.group(4))
+        nums_str = m.group(5)
+    else:
+        # 패턴 B: CODE 없이 긴 설명명이 바로 시작 (INSURANCE FEE 등)
+        m2 = re.match(
+            r'^(.+?)\s+(JPY|USD|KRW)\s+([\d,\.]+)\s+([\d\.,\s\|\-]+)$',
+            line,
+        )
+        if not m2:
+            return None
+        raw_name = m2.group(1).strip()
+        # 설명이 너무 짧거나 숫자/특수문자만이면 스킵
+        if len(raw_name) < 3 or re.match(r'^[\d\s,\.\-\|]+$', raw_name):
+            return None
+        # 코드 자동 생성: 첫 단어 앞 3글자 대문자
+        code     = re.sub(r'[^A-Z]', '', raw_name.upper())[:5] or "MISC"
+        name     = raw_name
+        currency = m2.group(2).upper()
+        ex_rate  = _parse_float(m2.group(3))
+        nums_str = m2.group(4)
 
     # 숫자 추출 (콤마 제거 후)
     raw_nums = re.findall(r'-?[\d]+(?:,[\d]{3})*(?:\.[\d]+)?', nums_str)
@@ -443,7 +483,6 @@ def _parse_charge_line(line: str) -> Optional[ParsedCharge]:
         amount_jpy = nums[-1]
         amount     = 0.0
     else:  # USD / KRW
-        # 외화(작은 수) vs JPY(큰 수) 구분
         small = [n for n in nums if abs(n) < 10_000]
         large = [n for n in nums if abs(n) >= 1_000]
         amount     = small[-1] if small else nums[0]

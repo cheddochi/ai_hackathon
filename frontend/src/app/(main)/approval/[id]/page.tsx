@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useState } from "react";
+import React from "react";
 import { useParams, useRouter } from "next/navigation";
 import Header from "@/components/layout/Header";
 import { profitSheetApi, approvalApi, masterApi } from "@/lib/api";
@@ -362,6 +363,117 @@ function ChargeTable({ rows, krwPerJpy }: { rows: any[]; krwPerJpy: number }) {
   );
 }
 
+// ── AI 분석 마크다운 렌더러 ──────────────────────────────────
+function renderInline(text: string): React.ReactNode[] {
+  // **bold** 처리
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((p, i) => {
+    if (p.startsWith("**") && p.endsWith("**")) {
+      return <strong key={i}>{p.slice(2, -2)}</strong>;
+    }
+    return p;
+  });
+}
+
+function AiAnalysisSection({ text }: { text: string }) {
+  if (!text) return null;
+
+  const lines = text.split("\n");
+  const elements: React.ReactNode[] = [];
+  let tableRows: string[][] = [];
+  let inTable = false;
+  let listItems: string[] = [];
+
+  const flushTable = () => {
+    if (!tableRows.length) return;
+    // 첫 행은 헤더, 두 번째는 구분선 (스킵), 나머지는 데이터
+    const [header, , ...rows] = tableRows;
+    elements.push(
+      <table key={`tbl-${elements.length}`} className="w-full text-sm border-collapse my-2">
+        <thead>
+          <tr className="bg-gray-50">
+            {header.map((h, i) => (
+              <th key={i} className="border border-gray-200 px-3 py-1.5 text-left font-semibold text-gray-700">{renderInline(h)}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, ri) => (
+            <tr key={ri} className="even:bg-gray-50">
+              {row.map((cell, ci) => (
+                <td key={ci} className="border border-gray-200 px-3 py-1.5 text-gray-800">{renderInline(cell)}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    );
+    tableRows = [];
+    inTable = false;
+  };
+
+  const flushList = () => {
+    if (!listItems.length) return;
+    elements.push(
+      <ul key={`ul-${elements.length}`} className="list-disc list-inside space-y-1.5 my-2">
+        {listItems.map((item, i) => (
+          <li key={i} className="text-sm text-gray-700">{renderInline(item)}</li>
+        ))}
+      </ul>
+    );
+    listItems = [];
+  };
+
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+
+    // 테이블 행
+    if (line.startsWith("|")) {
+      flushList();
+      inTable = true;
+      const cells = line.split("|").map((c) => c.trim()).filter((_, i, arr) => i > 0 && i < arr.length - 1);
+      tableRows.push(cells);
+      continue;
+    }
+
+    if (inTable) flushTable();
+
+    // 리스트 항목
+    if (/^[-*]\s/.test(line)) {
+      elements.splice(elements.length); // no-op, just flush list later
+      listItems.push(line.replace(/^[-*]\s/, ""));
+      continue;
+    }
+
+    flushList();
+
+    if (!line) { elements.push(<div key={`br-${elements.length}`} className="h-2" />); continue; }
+
+    // 제목 (##)
+    if (line.startsWith("## ")) {
+      elements.push(<h3 key={elements.length} className="text-sm font-bold text-gray-800 mt-4 mb-1">{renderInline(line.slice(3))}</h3>);
+      continue;
+    }
+    if (line.startsWith("# ")) {
+      elements.push(<h2 key={elements.length} className="font-bold text-gray-900 mt-2">{renderInline(line.slice(2))}</h2>);
+      continue;
+    }
+
+    // 일반 텍스트
+    elements.push(<p key={elements.length} className="text-sm text-gray-700 leading-relaxed">{renderInline(line)}</p>);
+  }
+
+  flushTable();
+  flushList();
+
+  return (
+    <div className="card border-l-4 border-accent">
+      <p className="text-xs font-semibold text-accent mb-3">🤖 AI 거래 분석</p>
+      <div className="space-y-1">{elements}</div>
+    </div>
+  );
+}
+
 // ── 메인 페이지 ──────────────────────────────────────────────
 export default function ApprovalDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -588,6 +700,11 @@ export default function ApprovalDetailPage() {
             )}
           </div>
         </div>
+
+        {/* AI 거래 분석 — full width */}
+        {sheet.ai_analysis && (
+          <AiAnalysisSection text={sheet.ai_analysis} />
+        )}
       </div>
     </div>
   );

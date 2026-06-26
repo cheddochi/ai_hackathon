@@ -60,6 +60,8 @@ class ProfitSheetHeader(Base):
     human_decided_at = Column(DateTime(timezone=True), nullable=True)  # 결재 일시
     # ── 계약 시점 환율 ─────────────────────────────────────────
     exchange_rate_note = Column(String(200), nullable=True)  # 환율 출처/기준일시 메모
+    # ── AI 거래 분석 ───────────────────────────────────────────
+    ai_analysis = Column(Text, nullable=True)               # Claude API 생성 거래 분석 (마크다운)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

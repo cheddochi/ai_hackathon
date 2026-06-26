@@ -21,6 +21,8 @@ def _migrate_add_columns() -> None:
         "ALTER TABLE profit_sheet_header ADD COLUMN IF NOT EXISTS human_decided_by  VARCHAR(100)",
         "ALTER TABLE profit_sheet_header ADD COLUMN IF NOT EXISTS human_decided_at  TIMESTAMPTZ",
         "ALTER TABLE profit_sheet_header ADD COLUMN IF NOT EXISTS exchange_rate_note VARCHAR(200)",
+        # v1.4.0 — AI 거래 분석
+        "ALTER TABLE profit_sheet_header ADD COLUMN IF NOT EXISTS ai_analysis       TEXT",
     ]
     with engine.connect() as conn:
         for stmt in statements:
