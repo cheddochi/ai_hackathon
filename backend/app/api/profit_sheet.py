@@ -414,10 +414,41 @@ def delete_profit_sheet(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """
+    AI 검토 완료 / 인간 승인·반려 상태 무관하게 삭제 가능.
+    FK 순서대로 cascade 삭제:
+      RuleEvaluationLog → ApprovalHistory → Todo → ProductivityHistory
+      → ProfitSheetDetail → ProfitSheetHeader
+    """
+    from app.models.result import ApprovalHistory, RuleEvaluationLog, Todo, ProductivityHistory
+
     sheet = db.query(ProfitSheetHeader).filter(ProfitSheetHeader.id == sheet_id).first()
     if not sheet:
         raise HTTPException(status_code=404, detail="Not found")
+
+    # 1) RuleEvaluationLog (approval_history_id FK)
+    approval_ids = [
+        row.id for row in
+        db.query(ApprovalHistory.id).filter(ApprovalHistory.header_id == sheet_id).all()
+    ]
+    if approval_ids:
+        db.query(RuleEvaluationLog).filter(
+            RuleEvaluationLog.approval_history_id.in_(approval_ids)
+        ).delete(synchronize_session=False)
+
+    # 2) ApprovalHistory
+    db.query(ApprovalHistory).filter(ApprovalHistory.header_id == sheet_id).delete()
+
+    # 3) Todo
+    db.query(Todo).filter(Todo.header_id == sheet_id).delete()
+
+    # 4) ProductivityHistory
+    db.query(ProductivityHistory).filter(ProductivityHistory.header_id == sheet_id).delete()
+
+    # 5) ProfitSheetDetail
     db.query(ProfitSheetDetail).filter(ProfitSheetDetail.header_id == sheet_id).delete()
+
+    # 6) ProfitSheetHeader
     db.delete(sheet)
     db.commit()
     return {"ok": True}

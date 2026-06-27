@@ -38,12 +38,24 @@ app = FastAPI(
     version="1.0.0",
 )
 
+import os as _os
+
+# allow_credentials=True + allow_origins=["*"] 조합은 CORS 스펙 위반 (브라우저 거부)
+# JWT는 Authorization 헤더로 전송하므로 credentials 모드 불필요
+_cors_origins_env = _os.environ.get("CORS_ORIGINS", "")
+_cors_origins = (
+    [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+    if _cors_origins_env
+    else ["*"]
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=False,     # JWT는 Authorization 헤더 → credentials 불필요
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # 라우터 등록
